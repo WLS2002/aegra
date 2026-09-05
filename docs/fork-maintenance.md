@@ -2,6 +2,23 @@
 
 This fork starts from upstream Aegra v0.10.4. Keep `upstream` pointed to the original repository and `origin` pointed to the maintained fork. Preserve the upstream license and history. Keep application graphs, credentials and deployment-specific records outside this repository.
 
+## Repository and branches
+
+The public native GitHub fork is https://github.com/WLS2002/aegra, with parent https://github.com/aegra/aegra.
+
+- `main` follows upstream and does not contain our release-specific patches.
+- `codex/harbor-0.10.4` is the maintained branch for the validated 0.10.4 runtime.
+- `harbor-v0.10.4.1` pins deployed source commit `1a38d2a4c3edfeaa9059c7214ffca7ae7c257d2f`. Keep published release tags immutable.
+
+Clone the maintenance branch explicitly when building the patched runtime:
+
+```bash
+git clone --branch codex/harbor-0.10.4 git@github.com:WLS2002/aegra.git
+git -C aegra remote add upstream git@github.com:aegra/aegra.git
+```
+
+Review upstream updates before merging or cherry-picking them into the maintenance branch. GitHub's Sync fork action on `main` does not update the maintained release or deploy anything.
+
 ## Patch 1: atomic reject admission
 
 An explicit `multitask_strategy="reject"` returns HTTP 409 when the same user's Thread has a pending or running Run. Terminal Runs do not block admission. The check applies to the shared preparation path used by background, wait, streaming and scheduled runs.

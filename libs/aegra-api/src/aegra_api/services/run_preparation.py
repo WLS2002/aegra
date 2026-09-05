@@ -12,7 +12,7 @@ from uuid import uuid4
 import structlog
 from asgi_correlation_id import correlation_id
 from fastapi import HTTPException
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aegra_api.core.orm import Assistant as AssistantORM
@@ -23,7 +23,7 @@ from aegra_api.models import Run, RunCreate, User
 from aegra_api.models.run_job import RunBehavior, RunExecution, RunIdentity, RunJob
 from aegra_api.services.executor import executor
 from aegra_api.services.langgraph_service import get_langgraph_service
-from aegra_api.services.run_status import set_thread_status
+from aegra_api.services.run_status import ACTIVE_RUN_STATES, set_thread_status
 from aegra_api.utils.assistants import resolve_assistant_id
 from aegra_api.utils.run_utils import _merge_jsonb
 
@@ -186,6 +186,26 @@ async def update_thread_metadata(
     )
 
 
+async def _admit_run(session: AsyncSession, thread_id: str, *, user_id: str, strategy: str | None) -> None:
+    # Serialize admission across API instances, including threads not yet created.
+    # The transaction releases the lock only after the pending run is committed.
+    await session.execute(select(func.pg_advisory_xact_lock(func.hashtextextended(thread_id, 0))))
+    if strategy != "reject":
+        return
+
+    active_run = await session.scalar(
+        select(RunORM.run_id)
+        .where(
+            RunORM.thread_id == thread_id,
+            RunORM.user_id == user_id,
+            RunORM.status.in_(ACTIVE_RUN_STATES),
+        )
+        .limit(1)
+    )
+    if active_run is not None:
+        raise HTTPException(409, "Thread already has a pending or running run")
+
+
 async def _prepare_run(
     session: AsyncSession,
     thread_id: str,
@@ -243,6 +263,8 @@ async def _prepare_run(
     available_graphs = langgraph_service.list_graphs()
     if assistant.graph_id not in available_graphs:
         raise HTTPException(404, f"Graph '{assistant.graph_id}' not found for assistant")
+
+    await _admit_run(session, thread_id, user_id=user.identity, strategy=request.multitask_strategy)
 
     # Mark thread as busy and update metadata
     await update_thread_metadata(

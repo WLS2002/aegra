@@ -184,3 +184,7 @@ Apache 2.0 - see [LICENSE](LICENSE).
     <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=aegra/aegra&type=Date" />
   </picture>
 </a>
+
+## Maintenance fork
+
+This checkout maintains focused runtime patches on an upstream release. See [patch scope, validation and update policy](docs/fork-maintenance.md).

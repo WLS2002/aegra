@@ -1,0 +1,16 @@
+ARG BASE_IMAGE=aegra-runtime:0.10.4
+FROM ghcr.io/astral-sh/uv:0.8.15 AS uv
+FROM ${BASE_IMAGE} AS wheel
+COPY --from=uv /uv /usr/local/bin/uv
+WORKDIR /fork
+COPY pyproject.toml uv.lock README.md ./
+COPY libs/ libs/
+RUN uv build --package aegra-api --wheel --out-dir /wheels
+
+FROM ${BASE_IMAGE}
+ARG FORK_REVISION
+LABEL org.opencontainers.image.revision=${FORK_REVISION}
+LABEL dev.agent-harbor.aegra-version="0.10.4+harbor.1"
+COPY --from=uv /uv /usr/local/bin/uv
+COPY --from=wheel /wheels /tmp/fork-wheels
+RUN uv pip install --python /app/.venv/bin/python --no-deps /tmp/fork-wheels/*.whl

@@ -12,6 +12,7 @@ from pydantic import (
     model_validator,
 )
 
+from aegra_api.models.run_job import RunIdentity
 from aegra_api.utils.status_compat import validate_run_status
 
 # Constraints for ``RunCreate.metadata`` keys/values, enforced at request
@@ -161,6 +162,7 @@ class Run(BaseModel):
     output: dict[str, Any] | None = Field(
         None, description="Final output produced by the run, or null if not yet complete."
     )
+    parent: RunIdentity | None = Field(None, description="Trusted parent execution that created this run.")
     error_message: str | None = Field(None, description="Error message if the run failed.")
     config: dict[str, Any] | None = Field(
         default_factory=dict, description="Configuration passed to the graph at runtime."

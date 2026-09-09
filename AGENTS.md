@@ -1,19 +1,23 @@
-# AGENTS.md
+# AEGRA 协作规则
 
-This file provides context for AI coding agents working with this repository.
+## 读取入口
 
-**📖 For complete documentation, see [CLAUDE.md](./CLAUDE.md)**
+- 在当前工作区中，先读[总 AGENTS.md](../AGENTS.md)、[公共记忆协议](../docs/agent-memory-protocol.md)和[总记忆索引](../.ai/README.md)。
+- 必读本仓 [CLAUDE.md](CLAUDE.md)、[记忆索引](.ai/README.md)和当前任务文档；工程结构、代码规范及完整验证流程以 CLAUDE.md 为入口，避免重复维护。
+- 公共入口在独立克隆中缺失时，说明缺失并继续按本仓规则工作。最低记忆要求：读取本仓索引与匹配任务，notes 只追加、任务速查及时更新，事实与推测分开，`.ai/` 本地不入 Git、不保存秘密。
 
-The `CLAUDE.md` file contains all the detailed information about:
-- Project overview and architecture
-- Quick start commands
-- Testing guidelines
-- Code quality standards
-- Database migrations
-- Development patterns
-- API endpoints
-- Common tasks
-- Environment variables
-- PR guidelines
+## 本仓职责
 
-This file exists to provide a quick reference point for AI agents. All detailed information is maintained in `CLAUDE.md` to avoid duplication.
+- 维护通用运行时、Agent Protocol HTTP 接口、执行与持久化集成及兼容修复；Ozon 的 Graph、业务规则、文案和凭据归应用。
+- LangGraph 负责图执行与状态持久化，HTTP 层负责协议适配；沿用 CLAUDE.md 描述的模块边界。
+- 修复先区分上游通用问题与应用问题；本地补丁记录依据的上游版本、改动原因、回归验证和上游跟进情况，不把设想写成已合并。
+- 历史维护记录按 `.ai/README.md` 路由读取；现有 worktree 与未提交改动必须保留。
+
+## 任务与验证
+
+- 用户明确实施目标即可匹配或建立任务，无需用户手工提供编号；纯讨论默认不建任务。
+- 本仓交付归本仓 `.ai/tasks/`；跨仓协调目标归总任务，本仓复杂实施过程按需记录并互链。
+- 按 CLAUDE.md 执行适用测试、代码检查和文档更新；执行模式、数据库或协议行为改动覆盖对应回归与集成场景。
+- E2E 使用隔离服务及数据库，启动前确认 Compose 项目、端口和卷；CLAUDE.md 的启停步骤不授权操作现用生产服务，仅清理本次创建的测试资源。
+- 纯文档修改核对引用与差异，无需启动运行时；代码行为变化仍遵守 CLAUDE.md 的验证要求。
+- 记录版本、环境与实际验证结果，区分本地补丁、已发布版本和部署状态；阶段结束按公共协议交接。

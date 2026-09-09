@@ -287,3 +287,5 @@ AEGRA_CONFIG=aegra.json
 
 - **aegra-api**: Core API package providing the Agent Protocol server
 - **aegra**: Meta-package that installs both aegra-cli and aegra-api
+
+Maintained fork execution extensions (0.11.0+harbor.1): [documentation](../../docs/agent-execution.md).

@@ -15,9 +15,10 @@ from sqlalchemy import CursorResult, exists, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aegra_api.core.orm import Run as RunORM
+from aegra_api.core.orm import RunWakeup, _get_session_maker
 from aegra_api.core.orm import Thread as ThreadORM
-from aegra_api.core.orm import _get_session_maker
 from aegra_api.core.serializers import GeneralSerializer
+from aegra_api.models.wakeups import TimedWakeup
 from aegra_api.utils.status_compat import validate_run_status, validate_thread_status
 
 logger = structlog.getLogger(__name__)
@@ -158,6 +159,7 @@ async def finalize_run(
     thread_status: str,
     output: Any = None,
     error: str | None = None,
+    wakeups: list[TimedWakeup] | None = None,
 ) -> bool:
     """Conditionally update run and thread status in one transaction.
 
@@ -199,6 +201,9 @@ async def finalize_run(
             validated_thread,
             user_id=user_id,
         )
+        if validated_run == "interrupted" and validated_thread == "interrupted":
+            for wakeup in wakeups or []:
+                session.add(RunWakeup(run_id=run_id, **wakeup.model_dump(), status="pending"))
         await session.commit()
 
     logger.info("Finalized run", run_id=run_id, status=validated_run, thread_status=validated_thread)

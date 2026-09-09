@@ -3,13 +3,13 @@
 import asyncio
 import contextlib
 from collections.abc import AsyncGenerator, MutableMapping
-from typing import Any
+from typing import Annotated, Any
 
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from redis import RedisError
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette import EventSourceResponse
 
@@ -17,15 +17,16 @@ from aegra_api.core.active_runs import active_runs
 from aegra_api.core.auth_deps import auth_dependency, get_current_user
 from aegra_api.core.auth_handlers import build_auth_context, handle_event
 from aegra_api.core.orm import Run as RunORM
+from aegra_api.core.orm import RunWakeup, _get_session_maker, get_session
 from aegra_api.core.orm import Thread as ThreadORM
-from aegra_api.core.orm import _get_session_maker, get_session
 from aegra_api.core.sse import create_end_event, get_sse_headers, make_sse_response, sse_to_bytes
 from aegra_api.models import Run, RunCreate, RunStatus, User
 from aegra_api.models.enums import RunCancellationAction
 from aegra_api.models.errors import CONFLICT, NOT_FOUND, SSE_RESPONSE
 from aegra_api.services.broker import broker_manager
-from aegra_api.services.run_preparation import _prepare_run
-from aegra_api.services.run_status import interrupt_unowned_run
+from aegra_api.services.run_auth import apply_run_authorization
+from aegra_api.services.run_preparation import _admit_run, _prepare_run
+from aegra_api.services.run_status import interrupt_unowned_run, set_thread_status_if_no_active_runs
 from aegra_api.services.run_waiters import TERMINAL_STATES, encode_output, heartbeat_wait_body
 from aegra_api.services.streaming_service import streaming_service
 from aegra_api.settings import settings
@@ -49,6 +50,34 @@ async def _request_run_interruption(
 ) -> None:
     """Interrupt a run without overwriting a terminal or live-owned run."""
     if run_orm.status in TERMINAL_STATES:
+        if run_orm.status == "interrupted":
+            await _admit_run(session, run_orm.thread_id, user_id=run_orm.user_id, strategy=None)
+            cancelled = await session.scalars(
+                update(RunWakeup)
+                .where(
+                    RunWakeup.run_id == run_orm.run_id,
+                    RunWakeup.status == "pending",
+                )
+                .values(status="cancelled")
+                .returning(RunWakeup.interrupt_id)
+            )
+            if list(cancelled):
+                latest = await session.scalar(
+                    select(RunORM.run_id)
+                    .where(
+                        RunORM.thread_id == run_orm.thread_id,
+                    )
+                    .order_by(RunORM.created_at.desc(), RunORM.run_id.desc())
+                    .limit(1)
+                )
+                if latest == run_orm.run_id:
+                    await set_thread_status_if_no_active_runs(
+                        session,
+                        [run_orm.thread_id],
+                        "idle",
+                        user_id=run_orm.user_id,
+                    )
+            await session.commit()
         return
 
     reconciled = await interrupt_unowned_run(
@@ -84,28 +113,7 @@ async def _request_run_interruption(
 
 
 async def _apply_create_run_auth(user: User, thread_id: str, request: RunCreate) -> None:
-    """Authorize threads.create_run and merge config/context overrides into request.
-
-    Handler-returned filter dict wins; otherwise fall back to in-place value mutations.
-    """
-    ctx = build_auth_context(user, "threads", "create_run")
-    value = {**request.model_dump(), "thread_id": thread_id}
-    filters = await handle_event(ctx, value)
-
-    source = filters if filters is not None else value
-    config_overrides = source.get("config")
-    if isinstance(config_overrides, dict):
-        request.config = {**(request.config or {}), **config_overrides}
-    context_overrides = source.get("context")
-    if isinstance(context_overrides, dict):
-        request.context = {**(request.context or {}), **context_overrides}
-
-    # Creating a run also reads its assistant, so per-assistant handler rules
-    # apply here exactly as they do in the cron-create chain.
-    await handle_event(
-        build_auth_context(user, "assistants", "read"),
-        {"assistant_id": request.assistant_id},
-    )
+    await apply_run_authorization(user, thread_id, request, event_handler=handle_event)
 
 
 @router.post("/threads/{thread_id}/runs", response_model=Run, responses={**NOT_FOUND, **CONFLICT})
@@ -114,6 +122,7 @@ async def create_run(
     request: RunCreate,
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> Run:
     """Create and execute a new run.
 
@@ -128,7 +137,9 @@ async def create_run(
 
     await _apply_create_run_auth(user, thread_id, request)
 
-    _run_id, run, _job = await _prepare_run(session, thread_id, request, user, initial_status="pending")
+    _run_id, run, _job = await _prepare_run(
+        session, thread_id, request, user, initial_status="pending", idempotency_key=idempotency_key
+    )
 
     return run
 
@@ -138,6 +149,7 @@ async def create_and_stream_run(
     thread_id: str,
     request: RunCreate,
     user: User = Depends(get_current_user),
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> EventSourceResponse:
     """Create a new run and stream its execution via SSE.
 
@@ -161,7 +173,9 @@ async def create_and_stream_run(
 
         await _apply_create_run_auth(user, thread_id, request)
 
-        run_id, run, _job = await _prepare_run(session, thread_id, request, user, initial_status="pending")
+        run_id, run, _job = await _prepare_run(
+            session, thread_id, request, user, initial_status="pending", idempotency_key=idempotency_key
+        )
 
     # Default to cancel on disconnect - this matches user expectation that clicking
     # "Cancel" in the frontend will stop the backend task. Users can explicitly
@@ -264,6 +278,39 @@ async def list_runs(
     return runs
 
 
+@router.get("/threads/{thread_id}/children", response_model=list[Run], responses={**NOT_FOUND})
+async def list_child_runs(
+    thread_id: str,
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> list[Run]:
+    """Read child executions created by this thread, including across resumes."""
+    await handle_event(build_auth_context(user, "threads", "read"), {"thread_id": thread_id})
+    parent = await session.scalar(
+        select(ThreadORM.thread_id).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
+    )
+    if parent is None:
+        raise HTTPException(404, "Parent thread not found")
+    rows = await session.scalars(
+        select(RunORM)
+        .where(
+            RunORM.user_id == user.identity,
+            RunORM.execution_params["parent"]["thread_id"].as_string() == thread_id,
+        )
+        .order_by(RunORM.created_at.desc(), RunORM.run_id)
+        .offset(offset)
+        .limit(limit)
+    )
+    result: list[Run] = []
+    for row in rows:
+        # Child thread rules may be narrower than the parent's rules.
+        await handle_event(build_auth_context(user, "threads", "read"), {"thread_id": row.thread_id})
+        result.append(Run.model_validate(row))
+    return result
+
+
 @router.patch("/threads/{thread_id}/runs/{run_id}", response_model=Run, responses={**NOT_FOUND})
 async def update_run(
     thread_id: str,
@@ -363,6 +410,7 @@ async def wait_for_run(
     thread_id: str,
     request: RunCreate,
     user: User = Depends(get_current_user),
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> StreamingResponse:
     """Create a run, execute it, and wait for completion.
 
@@ -384,7 +432,9 @@ async def wait_for_run(
 
         await _apply_create_run_auth(user, thread_id, request)
 
-        run_id, _run, _job = await _prepare_run(session, thread_id, request, user, initial_status="pending")
+        run_id, _run, _job = await _prepare_run(
+            session, thread_id, request, user, initial_status="pending", idempotency_key=idempotency_key
+        )
 
     # No pool connection held from here — safe for long waits
     return StreamingResponse(

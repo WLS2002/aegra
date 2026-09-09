@@ -180,6 +180,10 @@ class Run(Base):
     claimed_by: Mapped[str | None] = mapped_column(Text, nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
 
+    @property
+    def parent(self) -> dict[str, str] | None:
+        return (self.execution_params or {}).get("parent")
+
     # Indexes for performance
     __table_args__ = (
         Index("idx_runs_thread_id", "thread_id"),
@@ -189,6 +193,28 @@ class Run(Base):
         Index("idx_runs_created_at", "created_at"),
         Index("idx_runs_lease_reaper", "status", "lease_expires_at"),
     )
+
+
+class RunWakeup(Base):
+    __tablename__ = "run_wakeups"
+
+    run_id: Mapped[str] = mapped_column(Text, ForeignKey("runs.run_id", ondelete="CASCADE"), primary_key=True)
+    interrupt_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    checkpoint_id: Mapped[str] = mapped_column(Text, nullable=False)
+    due_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
+
+    __table_args__ = (Index("ix_run_wakeups_due", "status", "due_at"),)
+
+
+class RunRequest(Base):
+    __tablename__ = "run_requests"
+
+    user_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    thread_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    key: Mapped[str] = mapped_column(Text, primary_key=True)
+    request_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    run_id: Mapped[str] = mapped_column(Text, nullable=False, index=True)
 
 
 class Cron(Base):

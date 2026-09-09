@@ -188,3 +188,5 @@ Apache 2.0 - see [LICENSE](LICENSE).
 ## Maintenance fork
 
 This checkout maintains focused runtime patches on an upstream release. See [patch scope, validation and update policy](docs/fork-maintenance.md).
+
+Maintained fork execution extensions (0.11.0+harbor.1): [documentation](docs/agent-execution.md).

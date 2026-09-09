@@ -93,6 +93,7 @@ class TestSchedulerTick:
     async def test_find_due_crons_delegates_to_cron_service(self) -> None:
         scheduler = CronScheduler()
         mock_session = AsyncMock()
+        mock_session.scalar.return_value = None
         due_crons = [_make_cron_orm(cron_id="delegated")]
 
         with patch("aegra_api.services.cron_scheduler.CronService") as mock_service_cls:
@@ -110,6 +111,7 @@ class TestSchedulerTick:
         scheduler = CronScheduler()
 
         mock_session = AsyncMock()
+        mock_session.scalar.return_value = None
         mock_maker = Mock(return_value=mock_session)
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
         mock_session.__aexit__ = AsyncMock(return_value=False)
@@ -129,6 +131,7 @@ class TestSchedulerTick:
 
         cron = _make_cron_orm()
         mock_session = AsyncMock()
+        mock_session.scalar.return_value = None
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
         mock_session.__aexit__ = AsyncMock(return_value=False)
 
@@ -153,6 +156,7 @@ class TestSchedulerTick:
         cron_ok = _make_cron_orm(cron_id="ok")
         cron_fail = _make_cron_orm(cron_id="fail")
         mock_session = AsyncMock()
+        mock_session.scalar.return_value = None
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
         mock_session.__aexit__ = AsyncMock(return_value=False)
 
@@ -196,6 +200,7 @@ class TestTickTimezone:
         )
         cron.end_time = None
         mock_session = AsyncMock()
+        mock_session.scalar.return_value = None
 
         with (
             patch(
@@ -223,6 +228,7 @@ class TestTickTimezone:
         )
         cron.end_time = None
         mock_session = AsyncMock()
+        mock_session.scalar.return_value = None
 
         with (
             patch(
@@ -248,6 +254,35 @@ class TestTickTimezone:
 class TestFireCron:
     """Test CronScheduler._fire_cron()."""
 
+    async def test_recorded_occurrence_advances_even_after_run_retention_cleanup(self) -> None:
+        cron = _make_cron_orm()
+        session = AsyncMock()
+        session.scalar.return_value = "retained-receipt-for-deleted-run"
+        with (
+            patch("aegra_api.services.cron_scheduler._prepare_run", new_callable=AsyncMock) as prepare,
+            patch("aegra_api.services.cron_scheduler.CronService.advance_next_run", new_callable=AsyncMock) as advance,
+        ):
+            await CronScheduler._fire_cron(session, cron)
+        prepare.assert_not_awaited()
+        advance.assert_awaited_once_with(cron)
+
+    async def test_retries_use_same_occurrence_key_and_stateless_thread(self) -> None:
+        cron = _make_cron_orm()
+        session = AsyncMock()
+        session.scalar.return_value = None
+        with (
+            patch("aegra_api.services.cron_scheduler._prepare_run", new_callable=AsyncMock) as prepare,
+            patch("aegra_api.services.cron_scheduler.CronService.advance_next_run", new_callable=AsyncMock),
+            patch("aegra_api.services.cron_scheduler.schedule_background_cleanup"),
+        ):
+            prepare.return_value = ("same-run", Mock(), None)
+            await CronScheduler._fire_cron(session, cron)
+            await CronScheduler._fire_cron(session, cron)
+        first, second = prepare.await_args_list
+        assert first.args[1] == second.args[1]
+        assert first.kwargs["idempotency_key"] == second.kwargs["idempotency_key"]
+        assert cron.cron_id in first.kwargs["idempotency_key"]
+
     @pytest.mark.asyncio
     async def test_creates_run_and_advances(self) -> None:
         scheduler = CronScheduler()
@@ -257,6 +292,7 @@ class TestFireCron:
         )
         cron.end_time = None
         mock_session = AsyncMock()
+        mock_session.scalar.return_value = None
 
         with patch(
             "aegra_api.services.cron_scheduler._prepare_run",
@@ -276,9 +312,10 @@ class TestFireCron:
         cron = _make_cron_orm(thread_id=None, end_time=None)
         cron.end_time = None
         mock_session = AsyncMock()
+        mock_session.scalar.return_value = None
 
         with (
-            patch("aegra_api.services.cron_scheduler.uuid4", return_value="eph-thread-1"),
+            patch("aegra_api.services.cron_scheduler.uuid5", return_value="eph-thread-1"),
             patch(
                 "aegra_api.services.cron_scheduler._prepare_run",
                 new_callable=AsyncMock,
@@ -296,6 +333,7 @@ class TestFireCron:
         cron = _make_cron_orm(thread_id="thread-bound-1", end_time=None)
         cron.end_time = None
         mock_session = AsyncMock()
+        mock_session.scalar.return_value = None
 
         with (
             patch(
@@ -315,9 +353,10 @@ class TestFireCron:
         cron = _make_cron_orm(thread_id=None, on_run_completed="keep", end_time=None)
         cron.end_time = None
         mock_session = AsyncMock()
+        mock_session.scalar.return_value = None
 
         with (
-            patch("aegra_api.services.cron_scheduler.uuid4", return_value="eph-thread-keep"),
+            patch("aegra_api.services.cron_scheduler.uuid5", return_value="eph-thread-keep"),
             patch(
                 "aegra_api.services.cron_scheduler._prepare_run",
                 new_callable=AsyncMock,
@@ -330,27 +369,29 @@ class TestFireCron:
         mock_schedule.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_deletes_stateless_thread_when_run_setup_fails(self) -> None:
+    async def test_rolls_back_failed_setup_without_deleting_durable_run(self) -> None:
         scheduler = CronScheduler()
         cron = _make_cron_orm(thread_id=None, end_time=None)
         cron.end_time = None
         mock_session = AsyncMock()
+        mock_session.scalar.return_value = None
 
         with (
-            patch("aegra_api.services.cron_scheduler.uuid4", return_value="eph-thread-fail"),
+            patch("aegra_api.services.cron_scheduler.uuid5", return_value="eph-thread-fail"),
             patch(
                 "aegra_api.services.cron_scheduler._prepare_run",
                 new_callable=AsyncMock,
                 side_effect=RuntimeError("boom"),
             ),
             patch(
-                "aegra_api.services.cron_scheduler.delete_thread_by_id",
+                "aegra_api.services.run_cleanup.delete_thread_by_id",
                 new_callable=AsyncMock,
             ) as mock_delete,
         ):
             await scheduler._fire_cron(mock_session, cron)
 
-        mock_delete.assert_awaited_once_with("eph-thread-fail", cron.user_id)
+        mock_delete.assert_not_awaited()
+        mock_session.rollback.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_uses_cron_thread_id_when_set(self) -> None:
@@ -358,6 +399,7 @@ class TestFireCron:
         cron = _make_cron_orm(thread_id="t-bound", end_time=None)
         cron.end_time = None
         mock_session = AsyncMock()
+        mock_session.scalar.return_value = None
 
         with patch(
             "aegra_api.services.cron_scheduler._prepare_run",
@@ -375,6 +417,7 @@ class TestFireCron:
         cron = _make_cron_orm(thread_id=None, end_time=None)
         cron.end_time = None
         mock_session = AsyncMock()
+        mock_session.scalar.return_value = None
 
         with patch(
             "aegra_api.services.cron_scheduler._prepare_run",
@@ -395,6 +438,7 @@ class TestFireCron:
         past = datetime.now(UTC) - timedelta(hours=1)
         cron = _make_cron_orm(end_time=past)
         mock_session = AsyncMock()
+        mock_session.scalar.return_value = None
 
         with patch(
             "aegra_api.services.cron_scheduler._prepare_run",
@@ -414,16 +458,13 @@ class TestFireCron:
         cron = _make_cron_orm(end_time=None)
         cron.end_time = None
         mock_session = AsyncMock()
+        mock_session.scalar.return_value = None
 
         with (
             patch(
                 "aegra_api.services.cron_scheduler._prepare_run",
                 new_callable=AsyncMock,
             ) as mock_prepare,
-            patch(
-                "aegra_api.services.cron_scheduler.CronScheduler._cleanup_failed_stateless_thread",
-                new_callable=AsyncMock,
-            ),
         ):
             mock_prepare.side_effect = HTTPException(404, "assistant not found")
             # Should not raise
@@ -439,16 +480,13 @@ class TestFireCron:
         cron = _make_cron_orm(end_time=None)
         cron.end_time = None
         mock_session = AsyncMock()
+        mock_session.scalar.return_value = None
 
         with (
             patch(
                 "aegra_api.services.cron_scheduler._prepare_run",
                 new_callable=AsyncMock,
             ) as mock_prepare,
-            patch(
-                "aegra_api.services.cron_scheduler.CronScheduler._cleanup_failed_stateless_thread",
-                new_callable=AsyncMock,
-            ),
         ):
             mock_prepare.side_effect = RuntimeError("database connection lost")
             # Should not raise
@@ -476,6 +514,7 @@ class TestFireCron:
         )
         cron.end_time = None
         mock_session = AsyncMock()
+        mock_session.scalar.return_value = None
 
         with patch(
             "aegra_api.services.cron_scheduler._prepare_run",

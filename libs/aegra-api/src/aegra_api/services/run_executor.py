@@ -7,14 +7,17 @@ Single source of truth for executing a graph run. Both LocalExecutor
 """
 
 import asyncio
-from typing import Any
+from typing import Any, cast
 
 import structlog
+from langchain_core.runnables import RunnableConfig
 
 from aegra_api.core.active_runs import active_runs
 from aegra_api.core.auth_ctx import with_auth_ctx
+from aegra_api.core.execution_context import current_job
 from aegra_api.core.redis_manager import redis_manager
 from aegra_api.models.run_job import RunJob
+from aegra_api.models.wakeups import TimedWakeup, extract_wakeups
 from aegra_api.services.broker import broker_manager
 from aegra_api.services.event_streaming.native_stream import stream_native_v3_events
 from aegra_api.services.graph_streaming import stream_graph_events
@@ -38,6 +41,14 @@ _TIMEOUT_SAFE_MESSAGE = "TimeoutError: execution failed"
 
 
 async def execute_run(job: RunJob) -> None:
+    token = current_job.set(job)
+    try:
+        await _execute_run(job)
+    finally:
+        current_job.reset(token)
+
+
+async def _execute_run(job: RunJob) -> None:
     """Execute a graph run, stream events to the broker, and update DB.
 
     Handles the full lifecycle: status transitions, event streaming,
@@ -64,6 +75,7 @@ async def execute_run(job: RunJob) -> None:
                 status="interrupted",
                 thread_status="interrupted",
                 output=final_output.data,
+                wakeups=final_output.wakeups,
             )
         else:
             finalized = await finalize_run(
@@ -161,11 +173,12 @@ async def _best_effort_signal(fn: Any, *args: Any) -> None:
 class _GraphResult:
     """Accumulates output and interrupt state during graph streaming."""
 
-    __slots__ = ("data", "has_interrupt")
+    __slots__ = ("data", "has_interrupt", "wakeups")
 
     def __init__(self) -> None:
         self.data: dict[str, Any] = {}
         self.has_interrupt: bool = False
+        self.wakeups: list[TimedWakeup] = []
 
 
 async def _stream_graph(job: RunJob) -> _GraphResult:
@@ -192,6 +205,12 @@ async def _stream_graph(job: RunJob) -> _GraphResult:
         else:
             await _stream_legacy(job, graph, execution_input, run_config, stream_modes, result)
 
+        if result.has_interrupt:
+            latest_config = {**run_config, "configurable": dict(run_config.get("configurable", {}))}
+            latest_config["configurable"].pop("checkpoint_id", None)
+            snapshot = await graph.aget_state(cast(RunnableConfig, latest_config))
+            result.wakeups = extract_wakeups(snapshot)
+
     return result
 
 
@@ -208,7 +227,7 @@ async def _stream_legacy(
     async for event_type, event_data in stream_graph_events(
         graph=graph,
         input_data=execution_input,
-        config=run_config,
+        config=cast(RunnableConfig, run_config),
         stream_mode=stream_modes,
         context=job.execution.context,
         subgraphs=job.behavior.subgraphs,

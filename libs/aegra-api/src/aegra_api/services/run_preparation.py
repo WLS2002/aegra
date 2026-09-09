@@ -12,18 +12,21 @@ from uuid import uuid4
 import structlog
 from asgi_correlation_id import correlation_id
 from fastapi import HTTPException
+from redis.exceptions import RedisError
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aegra_api.core.orm import Assistant as AssistantORM
 from aegra_api.core.orm import Run as RunORM
+from aegra_api.core.orm import RunRequest, _get_session_maker
 from aegra_api.core.orm import Thread as ThreadORM
-from aegra_api.core.orm import _get_session_maker
 from aegra_api.models import Run, RunCreate, User
 from aegra_api.models.run_job import RunBehavior, RunExecution, RunIdentity, RunJob
 from aegra_api.services.executor import executor
 from aegra_api.services.langgraph_service import get_langgraph_service
+from aegra_api.services.run_requests import find_request, request_digest
 from aegra_api.services.run_status import ACTIVE_RUN_STATES, set_thread_status
+from aegra_api.settings import settings
 from aegra_api.utils.assistants import resolve_assistant_id
 from aegra_api.utils.run_utils import _merge_jsonb
 
@@ -171,6 +174,9 @@ async def update_thread_metadata(
         session.add(thread_orm)
         return
 
+    if user_id is not None and thread.user_id != user_id:
+        raise HTTPException(404, "Thread not found")
+
     md = dict(getattr(thread, "metadata_json", {}) or {})
     md.update(
         {
@@ -214,6 +220,8 @@ async def _prepare_run(
     *,
     initial_status: str,
     event_streaming_v2: bool = False,
+    idempotency_key: str | None = None,
+    parent_identity: RunIdentity | None = None,
 ) -> tuple[str, Run, RunJob]:
     """Shared run-creation logic used by create, stream, and wait endpoints.
 
@@ -221,6 +229,14 @@ async def _prepare_run(
     builds a RunJob, submits it to the executor, and returns the triple
     ``(run_id, run_model, job)``.
     """
+    digest = request_digest(request) if idempotency_key is not None else None
+    if idempotency_key is not None:
+        saved = await find_request(
+            session, user_id=user.identity, thread_id=thread_id, key=idempotency_key, digest=digest or ""
+        )
+        if saved is not None:
+            return saved.run_id, Run.model_validate(saved), RunJob.from_run_orm(saved)
+
     await _validate_resume_command(session, thread_id, request.command)
 
     run_id = str(uuid4())
@@ -297,7 +313,20 @@ async def _prepare_run(
     # Persist run record with trace metadata for worker observability.
     # The correlation_id from the HTTP request is stored so workers can
     # link their logs and spans back to the original request.
+    # Continuations inherit only a trusted persisted parent, never user config.
+    if parent_identity is None and request.input is None:
+        previous = await session.scalar(
+            select(RunORM)
+            .where(RunORM.thread_id == thread_id, RunORM.user_id == user.identity)
+            .order_by(RunORM.created_at.desc(), RunORM.run_id.desc())
+            .limit(1)
+        )
+        persisted_parent = (previous.execution_params or {}).get("parent") if previous is not None else None
+        if persisted_parent is not None:
+            parent_identity = RunIdentity.model_validate(persisted_parent)
     exec_params = job.to_execution_params()
+    if parent_identity is not None:
+        exec_params["parent"] = parent_identity.model_dump()
     exec_params["trace"] = {
         "correlation_id": correlation_id.get(""),
         "user_id": user.identity,
@@ -322,12 +351,31 @@ async def _prepare_run(
         execution_params=exec_params,
     )
     session.add(run_orm)
+    if idempotency_key is not None:
+        session.add(
+            RunRequest(
+                user_id=user.identity,
+                thread_id=thread_id,
+                key=idempotency_key,
+                request_hash=digest,
+                run_id=run_id,
+            )
+        )
     await session.commit()
 
     run = Run.model_validate(run_orm)
 
     # Submit to executor
-    await executor.submit(job)
-    logger.info("Submitted run to executor", run_id=run_id)
+    try:
+        await executor.submit(job)
+    except (RedisError, OSError):
+        if not settings.redis.REDIS_BROKER_ENABLED:
+            raise
+        # The committed pending run is the durable queue intent. The lease
+        # reaper re-enqueues unclaimed runs after a broker outage. Returning
+        # success also prevents callers from deleting a recoverable thread.
+        logger.exception("Run persisted; queue delivery deferred to recovery", run_id=run_id)
+    else:
+        logger.info("Submitted run to executor", run_id=run_id)
 
     return run_id, run, job

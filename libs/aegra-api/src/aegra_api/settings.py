@@ -447,6 +447,11 @@ class EventStreamingSettings(EnvBase):
     FF_V2_EVENT_STREAMING: bool = True
 
 
+class WakeupSettings(EnvBase):
+    WAKEUPS_ENABLED: bool = True
+    WAKEUP_POLL_INTERVAL_SECONDS: float = Field(default=5, gt=0, le=60)
+
+
 class Settings:
     """Container object that instantiates all application settings groups."""
 
@@ -459,6 +464,7 @@ class Settings:
         self.redis = RedisSettings()
         self.worker = WorkerSettings()
         self.cron = CronSettings()
+        self.wakeups = WakeupSettings()
         self.event_streaming = EventStreamingSettings()
 
 

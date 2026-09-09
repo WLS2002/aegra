@@ -200,6 +200,8 @@ _SPEC_TUPLES: dict[tuple[str, str], tuple[str, str]] = {
     ("POST", "/threads/{thread_id}/runs/stream"): ("threads", "create_run"),
     ("POST", "/threads/{thread_id}/runs/wait"): ("threads", "create_run"),
     ("GET", "/threads/{thread_id}/runs"): ("threads", "search"),
+    # Fork capability: docs/runtime-capabilities.md; checks parent and each child.
+    ("GET", "/threads/{thread_id}/children"): ("threads", "read"),
     ("GET", "/threads/{thread_id}/runs/{run_id}"): ("threads", "read"),
     ("PATCH", "/threads/{thread_id}/runs/{run_id}"): ("threads", "update"),
     ("GET", "/threads/{thread_id}/runs/{run_id}/join"): ("threads", "read"),

@@ -7,11 +7,13 @@ explicitly sets ``on_completion="keep"``).
 """
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Mapping
-from uuid import uuid4
+from typing import Annotated
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import structlog
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette import EventSourceResponse
@@ -127,6 +129,7 @@ def _schedule_thread_cleanup(thread_id: str, user_id: str, *, reason: str) -> No
 async def stateless_wait_for_run(
     request: RunCreate,
     user: User = Depends(get_current_user),
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> StreamingResponse:
     """Create a stateless run and wait for completion.
 
@@ -134,13 +137,20 @@ async def stateless_wait_for_run(
     endpoint, and deletes the thread after the response finishes streaming
     (unless ``on_completion="keep"``).
     """
-    thread_id = str(uuid4())
+    thread_id = (
+        str(uuid5(NAMESPACE_URL, json.dumps(["aegra-stateless", user.identity, idempotency_key])))
+        if idempotency_key is not None
+        else str(uuid4())
+    )
     should_delete = request.on_completion != "keep"
 
     try:
-        response = await wait_for_run(thread_id, request, user)
+        if idempotency_key is None:
+            response = await wait_for_run(thread_id, request, user)
+        else:
+            response = await wait_for_run(thread_id, request, user, idempotency_key=idempotency_key)
     except Exception:
-        if should_delete:
+        if should_delete and idempotency_key is None:
             try:
                 await delete_thread_by_id(thread_id, user.identity)
             except _CLEANUP_ERRORS:
@@ -195,6 +205,7 @@ async def stateless_wait_for_run(
 async def stateless_stream_run(
     request: RunCreate,
     user: User = Depends(get_current_user),
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> EventSourceResponse:
     """Create a stateless run and stream its execution.
 
@@ -202,15 +213,22 @@ async def stateless_stream_run(
     ``create_and_stream_run`` endpoint, and deletes the thread after the
     stream finishes (unless ``on_completion="keep"``).
     """
-    thread_id = str(uuid4())
+    thread_id = (
+        str(uuid5(NAMESPACE_URL, json.dumps(["aegra-stateless", user.identity, idempotency_key])))
+        if idempotency_key is not None
+        else str(uuid4())
+    )
     should_delete = request.on_completion != "keep"
 
     try:
-        response = await create_and_stream_run(thread_id, request, user)
+        if idempotency_key is None:
+            response = await create_and_stream_run(thread_id, request, user)
+        else:
+            response = await create_and_stream_run(thread_id, request, user, idempotency_key=idempotency_key)
     except Exception:
         # create_and_stream_run may have auto-created the thread via
         # update_thread_metadata before raising; clean up to avoid orphans.
-        if should_delete:
+        if should_delete and idempotency_key is None:
             try:
                 await delete_thread_by_id(thread_id, user.identity)
             except _CLEANUP_ERRORS:
@@ -277,6 +295,7 @@ async def stateless_create_run(
     request: RunCreate,
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> Run:
     """Create a stateless background run.
 
@@ -284,15 +303,22 @@ async def stateless_create_run(
     endpoint, and schedules cleanup as a background task (unless
     ``on_completion="keep"``).
     """
-    thread_id = str(uuid4())
+    thread_id = (
+        str(uuid5(NAMESPACE_URL, json.dumps(["aegra-stateless", user.identity, idempotency_key])))
+        if idempotency_key is not None
+        else str(uuid4())
+    )
     should_delete = request.on_completion != "keep"
 
     try:
-        result = await create_run(thread_id, request, user, session)
+        if idempotency_key is None:
+            result = await create_run(thread_id, request, user, session)
+        else:
+            result = await create_run(thread_id, request, user, session, idempotency_key=idempotency_key)
     except Exception:
         # create_run may have auto-created the thread via
         # update_thread_metadata before raising; clean up to avoid orphans.
-        if should_delete:
+        if should_delete and idempotency_key is None:
             try:
                 await delete_thread_by_id(thread_id, user.identity)
             except _CLEANUP_ERRORS:

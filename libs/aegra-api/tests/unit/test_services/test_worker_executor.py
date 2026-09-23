@@ -1,6 +1,7 @@
 """Unit tests for worker_executor service."""
 
 import asyncio
+import time
 from collections.abc import Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -849,6 +850,7 @@ class TestDequeue:
 
     def _make_executor_with_blpop(self, blpop: AsyncMock) -> WorkerExecutor:
         executor = WorkerExecutor()
+        executor._last_postgres_poll = time.monotonic()
         executor._poll_postgres = AsyncMock(return_value="from-postgres")  # type: ignore[method-assign]
         self._client = MagicMock()
         self._client.blpop = blpop
@@ -866,21 +868,19 @@ class TestDequeue:
         executor._poll_postgres.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_returns_none_when_blpop_returns_none(self) -> None:
+    async def test_idle_redis_discovers_postgres_jobs(self) -> None:
         blpop = AsyncMock(return_value=None)
         executor = self._make_executor_with_blpop(blpop)
 
         with patch(f"{MODULE}.redis_manager.get_client", return_value=self._client):
             result = await executor._dequeue()
 
-        assert result is None
-        executor._poll_postgres.assert_not_awaited()
+        assert result == "from-postgres"
+        executor._poll_postgres.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_idle_socket_timeout_returns_none_without_fallback(self) -> None:
-        """A blocking BLPOP that hits the socket timeout raises redis TimeoutError
-        (a RedisError subclass). That is a normal idle expiry, not a connectivity
-        failure: it must return None silently, never poll Postgres (GH #bug)."""
+    async def test_idle_timeout_discovers_postgres_jobs(self) -> None:
+        """Read availability does not imply enqueue writes succeeded."""
         blpop = AsyncMock(side_effect=RedisTimeoutError("Timeout reading from redis:6379"))
         executor = self._make_executor_with_blpop(blpop)
 
@@ -890,8 +890,8 @@ class TestDequeue:
         ):
             result = await executor._dequeue()
 
-        assert result is None
-        executor._poll_postgres.assert_not_awaited()
+        assert result == "from-postgres"
+        executor._poll_postgres.assert_awaited_once()
         mock_warning.assert_not_called()
 
     @pytest.mark.asyncio

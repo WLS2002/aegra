@@ -14,9 +14,10 @@ cp .env.example .env
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PROJECT_NAME` | `Aegra` | Application name |
-| `VERSION` | `0.1.0` | Application version |
+| `VERSION` | `0.10.5` | Application version |
 | `DEBUG` | `false` | Enable debug mode |
 | `AEGRA_CONFIG` | `aegra.json` | Path to the configuration file |
+| `MAX_SEARCH_LIMIT` | `1000` | Max `limit` for `POST /threads/search` and `POST /store/items/search`. Omitted or null `limit` uses `min(20, MAX_SEARCH_LIMIT)`. Default cap matches LangGraph Platform threads.search (`1..1000`). |
 
 ## Database
 
@@ -73,7 +74,7 @@ POSTGRES_USER=user
 | `POSTGRES_DB` | `aegra` | Database name |
 | `POSTGRES_HOST` | `localhost` | Database host |
 | `POSTGRES_PASSWORD` | `password` | Database password |
-| `POSTGRES_PORT` | `5432` | Database port |
+| `POSTGRES_PORT` | `5432` | Port for direct connections and Docker's host mapping; the Compose API container always connects on internal port `5432` |
 | `POSTGRES_USER` | `user` | Database user |
 | `DB_ECHO_LOG` | `false` | Log all SQL statements |
 
@@ -208,3 +209,7 @@ When enabled, a `/metrics` endpoint serves standard HTTP request metrics (reques
 | `OTEL_EXPORTER_OTLP_HEADERS` | Headers as comma-separated `key=value` pairs |
 
 See [observability guide](/guides/observability) for configuration examples.
+
+## Workspace runtime hardening
+
+See [runtime hardening](../runtime-hardening.md) for scheduled principal resolution, cleanup recovery, real health probes and SSE replay limits in the workspace fork.

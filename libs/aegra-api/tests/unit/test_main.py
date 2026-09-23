@@ -39,6 +39,8 @@ async def test_lifespan_registers_otel_provider(monkeypatch):
     with (
         patch("aegra_api.main.run_migrations_async", new_callable=AsyncMock),
         patch("aegra_api.main.db_manager") as mock_db_manager,
+        patch("aegra_api.main.cleanup_sweeper.start", new_callable=AsyncMock),
+        patch("aegra_api.main.cleanup_sweeper.stop", new_callable=AsyncMock),
         patch("aegra_api.main.get_langgraph_service") as mock_get_langgraph_service,
     ):
         mock_db_manager.initialize = AsyncMock()
@@ -74,6 +76,8 @@ async def test_lifespan_calls_required_initialization():
     with (
         patch("aegra_api.main.run_migrations_async", new_callable=AsyncMock) as mock_migrations,
         patch("aegra_api.main.db_manager") as mock_db_manager,
+        patch("aegra_api.main.cleanup_sweeper.start", new_callable=AsyncMock),
+        patch("aegra_api.main.cleanup_sweeper.stop", new_callable=AsyncMock),
         patch("aegra_api.main.get_langgraph_service") as mock_get_langgraph_service,
         patch("aegra_api.main.setup_observability") as mock_setup_observability,
     ):
@@ -117,6 +121,8 @@ async def test_lifespan_skips_migrations_when_disabled(monkeypatch):
     with (
         patch("aegra_api.main.run_migrations_async", new_callable=AsyncMock) as mock_migrations,
         patch("aegra_api.main.db_manager") as mock_db_manager,
+        patch("aegra_api.main.cleanup_sweeper.start", new_callable=AsyncMock),
+        patch("aegra_api.main.cleanup_sweeper.stop", new_callable=AsyncMock),
         patch("aegra_api.main.get_langgraph_service") as mock_get_langgraph_service,
         patch("aegra_api.main.setup_observability"),
     ):
@@ -150,6 +156,8 @@ async def test_lifespan_runs_migrations_when_enabled(monkeypatch):
     with (
         patch("aegra_api.main.run_migrations_async", new_callable=AsyncMock) as mock_migrations,
         patch("aegra_api.main.db_manager") as mock_db_manager,
+        patch("aegra_api.main.cleanup_sweeper.start", new_callable=AsyncMock),
+        patch("aegra_api.main.cleanup_sweeper.stop", new_callable=AsyncMock),
         patch("aegra_api.main.get_langgraph_service") as mock_get_langgraph_service,
         patch("aegra_api.main.setup_observability"),
     ):

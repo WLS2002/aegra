@@ -94,8 +94,12 @@ class AppSettings(EnvBase):
     AEGRA_CONFIG: str = "aegra.json"  # Default config file path
     KEEPALIVE_INTERVAL_SECS: float = 5  # Heartbeat interval for join/wait endpoints
     AUTH_TYPE: LowerStr = "noop"
+    SCHEDULED_PRINCIPAL_RESOLVER: str = ""
+    CLEANUP_SWEEP_INTERVAL_SECONDS: float = Field(default=30, gt=0)
     ENV_MODE: UpperStr = "LOCAL"
     DEBUG: bool = False
+    # Default 1000 matches LangGraph Platform threads.search (Agent Server OpenAPI max).
+    MAX_SEARCH_LIMIT: int = Field(default=1000, ge=1)
 
     # Run alembic upgrade head on startup. Default True (dev / single-pod).
     # Set False for multi-pod K8s to avoid advisory-lock probe timeouts;
@@ -445,6 +449,10 @@ class EventStreamingSettings(EnvBase):
     """
 
     FF_V2_EVENT_STREAMING: bool = True
+    SSE_REPLAY_TTL_SECONDS: int = Field(default=600, ge=1)
+    SSE_REPLAY_MAX_EVENTS: int = Field(default=10_000, ge=1)
+    SSE_REPLAY_RUN_BYTES: int = Field(default=8 * 1024 * 1024, ge=1024)
+    SSE_REPLAY_TOTAL_BYTES: int = Field(default=128 * 1024 * 1024, ge=1024)
 
 
 class WakeupSettings(EnvBase):

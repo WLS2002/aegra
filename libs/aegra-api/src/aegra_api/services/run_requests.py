@@ -14,6 +14,9 @@ from aegra_api.models import RunCreate
 
 def request_digest(request: RunCreate) -> str:
     payload = request.model_dump(mode="json")
+    # Keep pre-checkpoint_id receipts byte-for-byte compatible, including old nulls.
+    if payload.get("checkpoint_id") is None:
+        payload.pop("checkpoint_id", None)
     try:
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
     except ValueError as exc:

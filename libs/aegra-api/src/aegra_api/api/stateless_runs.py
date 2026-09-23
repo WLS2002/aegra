@@ -32,6 +32,7 @@ from aegra_api.services.broker import broker_manager
 from aegra_api.services.run_cleanup import (
     _CLEANUP_ERRORS,
     _background_cleanup_tasks,
+    cleanup_thread_if_safe,
     delete_thread_by_id,
     schedule_background_cleanup,
 )
@@ -113,9 +114,20 @@ async def _delete_thread_with_log(thread_id: str, user_id: str, *, reason: str) 
         logger.exception(reason, thread_id=thread_id)
 
 
-def _schedule_thread_cleanup(thread_id: str, user_id: str, *, reason: str) -> None:
-    """Fire-and-forget delete keyed off ``_background_cleanup_tasks``."""
-    task = asyncio.create_task(_delete_thread_with_log(thread_id, user_id, reason=reason))
+async def _cleanup_completed_thread(run_id: str | None, thread_id: str, user_id: str, *, reason: str) -> None:
+    """Use the same status/sibling check for wait and stream cleanup."""
+    if run_id is None:
+        logger.info("Keeping ephemeral thread because run id is unavailable", thread_id=thread_id)
+        return
+    try:
+        await cleanup_thread_if_safe(run_id, thread_id, user_id)
+    except _CLEANUP_ERRORS:
+        logger.exception(reason, thread_id=thread_id, run_id=run_id)
+
+
+def _schedule_thread_cleanup(run_id: str, thread_id: str, user_id: str, *, reason: str) -> None:
+    """Fire-and-forget safe cleanup keyed off ``_background_cleanup_tasks``."""
+    task = asyncio.create_task(_cleanup_completed_thread(run_id, thread_id, user_id, reason=reason))
     _background_cleanup_tasks.add(task)
     task.add_done_callback(_background_cleanup_tasks.discard)
 
@@ -172,6 +184,7 @@ async def stateless_wait_for_run(
     # Stream endpoint keeps the slow-client branch where the consumer
     # actually subscribes to the broker.
     original_iterator = response.body_iterator
+    run_id = _extract_run_id_from_headers(response.headers)
 
     async def _wrapped_iterator() -> AsyncIterator[bytes]:
         completed = False
@@ -184,8 +197,8 @@ async def stateless_wait_for_run(
             if aclose is not None:
                 await aclose()
             if completed:
-                await _delete_thread_with_log(
-                    thread_id, user.identity, reason="Failed to delete ephemeral thread after wait"
+                await _cleanup_completed_thread(
+                    run_id, thread_id, user.identity, reason="Failed to delete ephemeral thread after wait"
                 )
             else:
                 logger.info(
@@ -261,14 +274,15 @@ async def stateless_stream_run(
             if aclose is not None:
                 await aclose()
             if completed:
-                await _delete_thread_with_log(
-                    thread_id, user.identity, reason="Failed to delete ephemeral thread after stream"
+                await _cleanup_completed_thread(
+                    run_id, thread_id, user.identity, reason="Failed to delete ephemeral thread after stream"
                 )
             elif run_id is not None and _run_finished(run_id):
                 # Slow-client / dead-proxy abort after the run already
                 # finished: there's nothing left to resume, so schedule a
                 # deferred delete instead of leaking the ephemeral thread.
                 _schedule_thread_cleanup(
+                    run_id,
                     thread_id,
                     user.identity,
                     reason="Failed to delete ephemeral thread after slow-client abort",

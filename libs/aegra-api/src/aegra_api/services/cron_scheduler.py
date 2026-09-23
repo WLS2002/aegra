@@ -15,7 +15,7 @@ Follows the same ``start()/stop()`` lifecycle pattern used by
 import asyncio
 import contextlib
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import NAMESPACE_URL, uuid5
 
 import structlog
@@ -30,9 +30,10 @@ from aegra_api.services.cron_service import (
     CronService,
     should_delete_stateless_thread,
 )
-from aegra_api.services.run_auth import apply_run_authorization
+from aegra_api.services.run_auth import apply_run_authorization, resolve_authorization_target
 from aegra_api.services.run_cleanup import schedule_background_cleanup
 from aegra_api.services.run_preparation import _prepare_run
+from aegra_api.services.scheduled_auth import restore_scheduled_user
 from aegra_api.settings import settings
 
 logger = structlog.getLogger(__name__)
@@ -170,6 +171,10 @@ class CronScheduler:
         now = datetime.now(UTC)
         should_delete_thread = should_delete_stateless_thread(cron)
         run_created = False
+        cron_id = cron.cron_id
+        failure_count = int(cron.consecutive_failures or 0) + 1
+        failure_code = "schedule_transient_error"
+        blocked = False
 
         # Liveness check: refuse to forge a User for a deleted/revoked identity.
         if not await _validate_cron_user(cron.user_id):
@@ -194,13 +199,9 @@ class CronScheduler:
         thread_id = cron.thread_id or str(
             uuid5(NAMESPACE_URL, json.dumps(["aegra-cron", cron.user_id, cron.cron_id, occurrence]))
         )
-        user = User(
-            identity=cron.user_id,
-            display_name="cron-scheduler",
-            is_authenticated=True,
-        )
-
         try:
+            _, graph_id = await resolve_authorization_target(User(identity=cron.user_id), cron.assistant_id)
+            user = await restore_scheduled_user(cron.principal, owner=cron.user_id, graph_id=graph_id, source="cron")
             # The receipt survives stateless run cleanup. A crash after firing
             # but before advancing the schedule must not repeat the occurrence.
             recorded_run_id = await session.scalar(
@@ -227,29 +228,62 @@ class CronScheduler:
             run_created = True
             logger.info("Cron occurrence recorded", cron_id=cron.cron_id, run_id=_run_id, thread_id=thread_id)
         except HTTPException as exc:
+            blocked = exc.status_code in {401, 403, 404, 422}
+            failure_code = (
+                "schedule_authorization_denied" if exc.status_code in {401, 403} else f"schedule_http_{exc.status_code}"
+            )
+            if isinstance(exc.detail, str) and exc.detail in {
+                "scheduled_principal_missing",
+                "scheduled_principal_revoked",
+                "scheduled_principal_invalid",
+            }:
+                failure_code = exc.detail
             logger.error(
                 "Cron run creation failed",
-                cron_id=cron.cron_id,
+                cron_id=cron_id,
                 status_code=exc.status_code,
-                detail=exc.detail,
+                error_code=failure_code,
             )
             # Preparation owns one transaction. Roll back incomplete setup;
             # never delete a thread whose commit acknowledgement may be lost.
             await session.rollback()
         except Exception:
-            logger.exception("Cron run creation failed unexpectedly", cron_id=cron.cron_id)
+            logger.exception("Cron run creation failed unexpectedly", cron_id=cron_id)
             # Preparation owns one transaction. Roll back incomplete setup;
             # never delete a thread whose commit acknowledgement may be lost.
             await session.rollback()
 
         if run_created:
+            await session.execute(
+                update(CronORM)
+                .where(CronORM.cron_id == cron_id)
+                .values(
+                    last_run_id=_run_id,
+                    last_enqueued_at=now,
+                    last_error_code=None,
+                    consecutive_failures=0,
+                    retry_at=None,
+                    blocked=False,
+                )
+            )
             # Delegate advance/disable to CronService so the rule lives in one place.
             await CronService(session).advance_next_run(cron)
         else:
             # Run setup failed: release the claim so the next tick retries,
             # but leave next_run_date unchanged.
             await session.execute(
-                update(CronORM).where(CronORM.cron_id == cron.cron_id).values(claimed_until=None, updated_at=now)
+                update(CronORM)
+                .where(CronORM.cron_id == cron_id)
+                .values(
+                    claimed_until=None,
+                    updated_at=now,
+                    last_error_code=failure_code,
+                    consecutive_failures=failure_count,
+                    blocked=blocked,
+                    retry_at=None
+                    if blocked
+                    else now + timedelta(seconds=min(900, 60 * 2 ** min(failure_count - 1, 4))),
+                )
             )
             await session.commit()
 

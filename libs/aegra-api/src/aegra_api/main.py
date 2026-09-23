@@ -40,6 +40,7 @@ from aegra_api.services.cron_scheduler import cron_scheduler
 from aegra_api.services.executor import executor
 from aegra_api.services.langgraph_service import get_langgraph_service
 from aegra_api.services.lease_reaper import lease_reaper
+from aegra_api.services.run_cleanup import cleanup_sweeper
 from aegra_api.services.wake_scheduler import wake_scheduler
 from aegra_api.settings import settings
 from aegra_api.utils.setup_logging import setup_logging
@@ -143,8 +144,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     if settings.wakeups.WAKEUPS_ENABLED:
         await wake_scheduler.start()
 
+    await cleanup_sweeper.start()
+
     yield
 
+    await cleanup_sweeper.stop()
     if settings.wakeups.WAKEUPS_ENABLED:
         await wake_scheduler.stop()
 

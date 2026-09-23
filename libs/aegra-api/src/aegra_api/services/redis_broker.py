@@ -14,7 +14,7 @@ import json
 import random
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Any
+from typing import Any, cast
 
 import structlog
 from redis import RedisError
@@ -24,6 +24,7 @@ from aegra_api.core.redis_manager import redis_manager
 from aegra_api.core.serializers import GeneralSerializer
 from aegra_api.models.enums import RunCancellationAction
 from aegra_api.services.base_broker import BaseBrokerManager, BaseRunBroker
+from aegra_api.services.replay_budget import CACHE_EVENT_LUA, replay_unavailable
 from aegra_api.settings import settings
 from aegra_api.utils import generate_event_id
 
@@ -31,12 +32,11 @@ logger = structlog.getLogger(__name__)
 
 _serializer = GeneralSerializer()
 
-# TTL for the replay buffer — safety net for runs that crash without cleanup.
-# cleanup_run() deletes the broker on normal completion; this TTL only matters
-# if cleanup never fires (e.g. process crash, OOM kill).
-_REPLAY_TTL_SECONDS = 600  # 10 minutes
+# Every write refreshes the TTL, so the buffer expires this long after the last
+# event, matching the in-memory post-completion window.
+_REPLAY_TTL_SECONDS = settings.event_streaming.SSE_REPLAY_TTL_SECONDS
 # Max events in the replay buffer (prevents unbounded growth)
-_REPLAY_MAX_EVENTS = 10_000
+_REPLAY_MAX_EVENTS = settings.event_streaming.SSE_REPLAY_MAX_EVENTS
 
 # Reconnect backoff for Redis pub/sub listeners
 _BACKOFF_BASE = 0.5
@@ -141,13 +141,23 @@ class RedisRunBroker(BaseRunBroker):
     async def _cache_event(self, message: str) -> None:
         """Append the event to the replay buffer and bump the sequence counter."""
         client = redis_manager.get_client()
-        pipe = client.pipeline()
-        pipe.rpush(self._cache_key, message)
-        pipe.ltrim(self._cache_key, -_REPLAY_MAX_EVENTS, -1)
-        pipe.expire(self._cache_key, _REPLAY_TTL_SECONDS)
-        pipe.incr(self._counter_key)
-        pipe.expire(self._counter_key, _REPLAY_TTL_SECONDS)
-        await pipe.execute()
+        prefix = settings.redis.REDIS_CHANNEL_PREFIX + "replay-budget:"
+        await cast(
+            Awaitable[Any],
+            client.eval(
+                CACHE_EVENT_LUA,
+                4,
+                self._cache_key,
+                prefix + "sizes",
+                prefix + "expires",
+                prefix + "total",
+                message,
+                _REPLAY_TTL_SECONDS,
+                settings.event_streaming.SSE_REPLAY_RUN_BYTES,
+                settings.event_streaming.SSE_REPLAY_TOTAL_BYTES,
+                _REPLAY_MAX_EVENTS,
+            ),
+        )
 
     async def _publish_event(self, message: str) -> None:
         """Broadcast the event to live subscribers."""
@@ -208,6 +218,12 @@ class RedisRunBroker(BaseRunBroker):
 
         last_yielded_event_id: str | None = None
         try:
+            for event_id, payload in await self.replay(None):
+                last_yielded_event_id = event_id
+                yield event_id, payload
+                if isinstance(payload, tuple) and payload[0] == "end":
+                    self._finished = True
+                    return
             while True:
                 message = await pubsub.get_message(
                     ignore_subscribe_messages=True,
@@ -268,9 +284,13 @@ class RedisRunBroker(BaseRunBroker):
             raw_messages = await client.lrange(self._cache_key, 0, _REPLAY_MAX_EVENTS - 1)  # type: ignore[invalid-await]
         except RedisError as e:
             logger.error(f"Redis replay failed for run {self.run_id}: {e}")
+            if last_event_id is not None:
+                raise replay_unavailable() from e
             return []
 
         if not raw_messages:
+            if last_event_id is not None:
+                raise replay_unavailable()
             return []
 
         all_events: list[tuple[str, Any]] = []
@@ -300,9 +320,8 @@ class RedisRunBroker(BaseRunBroker):
 
             events_after.append((event_id, payload))
 
-        # If last_event_id was not found in the buffer, return all events
         if not found_last:
-            return all_events
+            raise replay_unavailable()
 
         return events_after
 

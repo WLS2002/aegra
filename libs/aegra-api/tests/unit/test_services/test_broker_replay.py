@@ -1,6 +1,7 @@
 """Unit tests for in-memory broker replay functionality"""
 
 import pytest
+from fastapi import HTTPException
 
 from aegra_api.services.broker import RunBroker
 
@@ -79,9 +80,9 @@ class TestRunBrokerReplay:
 
         await broker.put("evt-1", ("values", {"a": 1}))
 
-        events = await broker.replay("evt-999")
-        assert len(events) == 1
-        assert events[0] == ("evt-1", ("values", {"a": 1}))
+        with pytest.raises(HTTPException) as exc:
+            await broker.replay("evt-999")
+        assert exc.value.status_code == 409
 
     @pytest.mark.asyncio
     async def test_replay_empty_buffer(self) -> None:
@@ -94,8 +95,9 @@ class TestRunBrokerReplay:
     async def test_replay_empty_buffer_with_last_event_id(self) -> None:
         broker = self._make_broker()
 
-        events = await broker.replay("evt-1")
-        assert events == []
+        with pytest.raises(HTTPException) as exc:
+            await broker.replay("evt-1")
+        assert exc.value.status_code == 409
 
     @pytest.mark.asyncio
     async def test_end_event_stored_in_replay_buffer(self) -> None:

@@ -1,5 +1,6 @@
 """Integration tests for runs CRUD operations"""
 
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from tests.fixtures.clients import create_test_app, make_client
@@ -779,17 +780,45 @@ class TestCreateRunValidation:
         )
         assert resp.status_code == 404
 
+    def test_create_run_with_only_checkpoint_id_passes_validation(self) -> None:
+        app = create_test_app(include_runs=True, include_threads=False)
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt: Any) -> None:
+                return None
+
+        override_session_dependency(app, Session)
+        client = make_client(app)
+
+        resp = client.post(
+            "/threads/test-thread-123/runs",
+            json={"assistant_id": "nonexistent", "checkpoint_id": "1ef4f797-8335-6428-8001-8a1503f9b875"},
+        )
+        # Past validation: the 404 comes from the assistant lookup.
+        assert resp.status_code == 404
+
+    def test_create_run_rejects_malformed_checkpoint_id(self) -> None:
+        app = create_test_app(include_runs=True, include_threads=False)
+        override_session_dependency(app, BasicSession)
+        client = make_client(app)
+
+        resp = client.post(
+            "/threads/test-thread-123/runs",
+            json={"assistant_id": "asst-123", "input": {"x": 1}, "checkpoint_id": "not-a-uuid"},
+        )
+        assert resp.status_code == 422
+
 
 class TestWaitForRunTimeouts:
     """Test wait_for_run timeout behavior.
 
-    wait_for_run now returns a StreamingResponse wrapping heartbeat_wait_body.
-    On timeout, the heartbeat generator reads the run's current output from DB
-    and yields it as the final JSON chunk.
+    wait_for_run returns a StreamingResponse wrapping heartbeat_wait_body.
+    On timeout the run never reached a terminal state, so the generator yields
+    an ``__error__`` envelope rather than whatever partial output is on the row.
     """
 
     def test_wait_for_run_timeout(self):
-        """Test that wait_for_run returns current state on timeout."""
+        """Test that wait_for_run reports the timeout instead of partial state."""
         app = create_test_app(include_runs=True, include_threads=False)
 
         # Mock assistant and run
@@ -853,4 +882,4 @@ class TestWaitForRunTimeouts:
 
             assert resp.status_code == 200
             # StreamingResponse: body is heartbeat newlines + final JSON
-            assert resp.json() == {"partial": "data"}
+            assert resp.json()["__error__"]["error"] == "TimeoutError"

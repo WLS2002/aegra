@@ -159,6 +159,7 @@ async def finalize_run(
     thread_status: str,
     output: Any = None,
     error: str | None = None,
+    error_details: dict[str, Any] | None = None,
     wakeups: list[TimedWakeup] | None = None,
 ) -> bool:
     """Conditionally update run and thread status in one transaction.
@@ -178,6 +179,8 @@ async def finalize_run(
         run_values["output"] = _safe_serialize(output, run_id)
     if error is not None:
         run_values["error_message"] = error
+    if error_details is not None:
+        run_values["error_details"] = error_details
 
     async with maker() as session:
         result = await session.execute(

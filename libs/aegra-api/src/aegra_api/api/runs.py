@@ -27,7 +27,7 @@ from aegra_api.services.broker import broker_manager
 from aegra_api.services.run_auth import apply_run_authorization
 from aegra_api.services.run_preparation import _admit_run, _prepare_run
 from aegra_api.services.run_status import interrupt_unowned_run, set_thread_status_if_no_active_runs
-from aegra_api.services.run_waiters import TERMINAL_STATES, encode_output, heartbeat_wait_body
+from aegra_api.services.run_waiters import TERMINAL_STATES, encode_output, heartbeat_wait_body, run_result_body
 from aegra_api.services.streaming_service import streaming_service
 from aegra_api.settings import settings
 from aegra_api.utils.status_compat import validate_run_status
@@ -386,7 +386,7 @@ async def join_run(
 
         if run_orm.status in TERMINAL_STATES:
             return StreamingResponse(
-                iter([encode_output(run_orm.output or {})]),
+                iter([encode_output(run_result_body(run_orm, str(run_id)))]),
                 media_type="application/json",
             )
 
@@ -508,10 +508,11 @@ async def stream_run(
             },
         )
 
-    # Stream active or pending runs via broker
+    # Validate reconnect before HTTP headers are committed.
+    replay_events = await streaming_service.prepare_replay(str(run_id), last_event_id) if last_event_id else None
 
     return make_sse_response(
-        sse_to_bytes(streaming_service.stream_run_execution(run_model, last_event_id)),
+        sse_to_bytes(streaming_service.stream_run_execution(run_model, last_event_id, replay_events=replay_events)),
         headers={
             **get_sse_headers(),
             "Location": f"/threads/{thread_id}/runs/{run_id}/stream",

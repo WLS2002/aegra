@@ -6,18 +6,22 @@ The broker handles both live event broadcast (via queue) and replay storage
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import structlog
 
 from aegra_api.core.active_runs import active_runs
 from aegra_api.models.enums import RunCancellationAction
-from aegra_api.services.base_broker import BaseBrokerManager, BaseRunBroker
+from aegra_api.services.base_broker import REPLAY_RETENTION_SECONDS, BaseBrokerManager, BaseRunBroker
+from aegra_api.services.replay_budget import replay_size, replay_unavailable
 from aegra_api.settings import settings
 from aegra_api.utils import generate_event_id
 
 logger = structlog.getLogger(__name__)
+
+# Sweep often enough that an expired broker is freed close to its deadline.
+_SWEEP_INTERVAL_SECONDS = 60
 
 
 class RunBroker(BaseRunBroker):
@@ -29,23 +33,52 @@ class RunBroker(BaseRunBroker):
     pub/sub backend. The replay buffer keeps resumable events for reconnect.
     """
 
-    def __init__(self, run_id: str) -> None:
+    def __init__(self, run_id: str, enforce_budget: Callable[[], None] | None = None) -> None:
         self.run_id = run_id
         self.finished = asyncio.Event()
         self._replay_buffer: list[tuple[str, Any]] = []
         self._subscribers: set[asyncio.Queue[tuple[str, Any]]] = set()
+        self._replay_sizes: list[int] = []
+        self._replay_bytes = 0
+        self._enforce_budget = enforce_budget
+        self._subscriber_bytes: dict[asyncio.Queue[tuple[str, Any]], int] = {}
         self._created_at = asyncio.get_running_loop().time()
+        self._finished_at: float | None = None
 
     async def put(self, event_id: str, payload: Any, *, resumable: bool = True) -> None:
         if self.finished.is_set():
             logger.warning(f"Attempted to put event {event_id} into finished broker for run {self.run_id}")
             return
 
+        size = replay_size(event_id, payload)
+        limits = settings.event_streaming
         if resumable:
             self._replay_buffer.append((event_id, payload))
+            self._replay_sizes.append(size)
+            self._replay_bytes += size
+            while (
+                self._replay_bytes > limits.SSE_REPLAY_RUN_BYTES
+                or len(self._replay_buffer) > limits.SSE_REPLAY_MAX_EVENTS
+            ):
+                self._replay_buffer.pop(0)
+                self._replay_bytes -= self._replay_sizes.pop(0)
+            if self._enforce_budget is not None:
+                self._enforce_budget()
 
         for queue in list(self._subscribers):
+            buffered = self._subscriber_bytes.get(queue, 0)
+            if buffered + size > limits.SSE_REPLAY_RUN_BYTES or queue.qsize() >= limits.SSE_REPLAY_MAX_EVENTS:
+                while not queue.empty():
+                    queue.get_nowait()
+                queue.put_nowait(
+                    (event_id, ("error", {"error": "replay_unavailable", "message": "reload run and thread state"}))
+                )
+                queue.put_nowait((event_id, ("end", {"status": "disconnected"})))
+                self._subscribers.discard(queue)
+                self._subscriber_bytes[queue] = 0
+                continue
             queue.put_nowait((event_id, payload))
+            self._subscriber_bytes[queue] = buffered + size
 
         # Check if this is an end event
         if isinstance(payload, tuple) and len(payload) >= 1 and payload[0] == "end":
@@ -66,6 +99,9 @@ class RunBroker(BaseRunBroker):
             while True:
                 try:
                     event_id, payload = await asyncio.wait_for(queue.get(), timeout=0.1)
+                    self._subscriber_bytes[queue] = max(
+                        0, self._subscriber_bytes.get(queue, 0) - replay_size(event_id, payload)
+                    )
                 except TimeoutError:
                     if self.finished.is_set() and queue.empty():
                         break
@@ -75,9 +111,12 @@ class RunBroker(BaseRunBroker):
                     break
         finally:
             self._subscribers.discard(queue)
+            self._subscriber_bytes.pop(queue, None)
 
     async def replay(self, last_event_id: str | None) -> list[tuple[str, Any]]:
         if not self._replay_buffer:
+            if last_event_id is not None:
+                raise replay_unavailable()
             return []
 
         if last_event_id is None:
@@ -88,10 +127,12 @@ class RunBroker(BaseRunBroker):
             if eid == last_event_id:
                 return list(self._replay_buffer[i + 1 :])
 
-        # last_event_id not found — return all
-        return list(self._replay_buffer)
+        raise replay_unavailable()
 
     def mark_finished(self) -> None:
+        if self.finished.is_set():
+            return
+        self._finished_at = asyncio.get_running_loop().time()
         self.finished.set()
         logger.debug(f"Broker for run {self.run_id} marked as finished")
 
@@ -104,6 +145,12 @@ class RunBroker(BaseRunBroker):
     def get_age(self) -> float:
         return asyncio.get_running_loop().time() - self._created_at
 
+    def get_finished_age(self) -> float | None:
+        """Seconds since the run finished, or None while it is still running."""
+        if self._finished_at is None:
+            return None
+        return asyncio.get_running_loop().time() - self._finished_at
+
 
 class BrokerManager(BaseBrokerManager):
     """Manages multiple RunBroker instances with periodic cleanup."""
@@ -115,9 +162,19 @@ class BrokerManager(BaseBrokerManager):
 
     def get_or_create_broker(self, run_id: str) -> RunBroker:
         if run_id not in self._brokers:
-            self._brokers[run_id] = RunBroker(run_id)
+            self._brokers[run_id] = RunBroker(run_id, self._enforce_replay_budget)
             logger.debug(f"Created new broker for run {run_id}")
         return self._brokers[run_id]
+
+    def _enforce_replay_budget(self) -> None:
+        total = sum(broker._replay_bytes for broker in self._brokers.values())
+        for broker in sorted(self._brokers.values(), key=lambda item: item._created_at):
+            if total <= settings.event_streaming.SSE_REPLAY_TOTAL_BYTES:
+                break
+            total -= broker._replay_bytes
+            broker._replay_buffer.clear()
+            broker._replay_sizes.clear()
+            broker._replay_bytes = 0
 
     def get_broker(self, run_id: str) -> RunBroker | None:
         return self._brokers.get(run_id)
@@ -177,19 +234,25 @@ class BrokerManager(BaseBrokerManager):
         """Return the current event sequence from the in-memory counter."""
         return self._event_counters.get(run_id, 0)
 
+    def sweep_expired_brokers(self, retention_seconds: float = REPLAY_RETENTION_SECONDS) -> list[str]:
+        """Drop finished brokers past the replay window. Returns the removed run ids."""
+        expired = [
+            run_id
+            for run_id, broker in self._brokers.items()
+            if broker.is_empty()
+            and (finished_age := broker.get_finished_age()) is not None
+            and finished_age > retention_seconds
+        ]
+        for run_id in expired:
+            self.remove_broker(run_id)
+            logger.info(f"Cleaned up expired broker for run {run_id}")
+        return expired
+
     async def _cleanup_old_brokers(self) -> None:
-        """Remove finished brokers older than 1 hour every 5 minutes."""
         while True:
             try:
-                await asyncio.sleep(300)
-                to_remove = [
-                    run_id
-                    for run_id, broker in self._brokers.items()
-                    if broker.is_finished() and broker.is_empty() and broker.get_age() > 3600
-                ]
-                for run_id in to_remove:
-                    self.remove_broker(run_id)
-                    logger.info(f"Cleaned up old broker for run {run_id}")
+                await asyncio.sleep(_SWEEP_INTERVAL_SECONDS)
+                self.sweep_expired_brokers(settings.event_streaming.SSE_REPLAY_TTL_SECONDS)
             except asyncio.CancelledError:
                 break
             except Exception:

@@ -38,6 +38,7 @@ from aegra_api.services.cron_service import (
     get_cron_service,
     should_delete_stateless_thread,
 )
+from aegra_api.services.run_auth import apply_run_authorization
 from aegra_api.services.run_cleanup import delete_thread_by_id, schedule_background_cleanup
 from aegra_api.services.run_preparation import _prepare_run
 
@@ -155,7 +156,7 @@ async def update_cron(
     value = {"cron_id": cron_id, **request.model_dump(exclude_none=True)}
     await handle_event(ctx, value)
 
-    return await service.update_cron(cron_id, request, user.identity)
+    return await service.update_cron(cron_id, request, user.identity, principal=user)
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +237,7 @@ async def _create_cron_atomic(
     When ``request.enabled`` is False the first run is suppressed entirely
     and the persisted ``Cron`` is returned instead of a ``Run``.
     """
-    cron = await service.create_cron(request, user.identity, thread_id=thread_id)
+    cron = await service.create_cron(request, user.identity, thread_id=thread_id, principal=user)
 
     if request.enabled is False:
         return _cron_to_response(cron)
@@ -268,6 +269,7 @@ async def _trigger_first_run(
     run_request = _build_run_create(cron)
 
     try:
+        await apply_run_authorization(user, effective_thread_id, run_request)
         _run_id, run, _job = await _prepare_run(
             session,
             effective_thread_id,

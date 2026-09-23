@@ -5,6 +5,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 from redis.exceptions import ConnectionError as RedisConnectionError
 
 from aegra_api.services.redis_broker import (
@@ -77,6 +78,7 @@ class TestRedisRunBroker:
         mock_pipe.execute = AsyncMock()
         mock_client = MagicMock()
         mock_client.publish = AsyncMock()
+        mock_client.eval = mock_pipe.execute
         mock_client.pipeline.return_value = mock_pipe
 
         with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
@@ -93,18 +95,12 @@ class TestRedisRunBroker:
             assert data["event_id"] == "evt-1"
             assert data["payload"] == ["values", {"msg": "hello"}]
 
-            # Should use pipeline for cache operations
-            mock_client.pipeline.assert_called_once()
-            mock_pipe.rpush.assert_called_once()
-            cache_key, cached_msg = mock_pipe.rpush.call_args[0]
-            assert cache_key == "aegra:run:cache:run-123"
-            assert json.loads(cached_msg) == data
-
-            # Should trim, set TTL, and increment counter in pipeline
-            mock_pipe.ltrim.assert_called_once()
-            mock_pipe.expire.assert_called()
-            mock_pipe.incr.assert_called_once_with("aegra:run:counter:run-123")
-            mock_pipe.execute.assert_awaited_once()
+            mock_client.eval.assert_awaited_once()
+            args = mock_client.eval.call_args.args
+            assert args[1] == 4
+            assert args[2] == "aegra:run:cache:run-123"
+            assert json.loads(args[6]) == data
+            mock_pipe.incr.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_put_non_resumable_skips_cache(self) -> None:
@@ -128,6 +124,7 @@ class TestRedisRunBroker:
         mock_pipe.execute = AsyncMock()
         mock_client = MagicMock()
         mock_client.publish = AsyncMock()
+        mock_client.eval = mock_pipe.execute
         mock_client.pipeline.return_value = mock_pipe
 
         with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
@@ -158,6 +155,7 @@ class TestRedisRunBroker:
         mock_pipe.execute = AsyncMock(side_effect=RedisConnectionError("Redis down"))
         mock_client = MagicMock()
         mock_client.publish = AsyncMock()
+        mock_client.eval = mock_pipe.execute
         mock_client.pipeline.return_value = mock_pipe
 
         with (
@@ -183,6 +181,7 @@ class TestRedisRunBroker:
         mock_pipe.execute = AsyncMock(side_effect=[RedisConnectionError("blip"), None])
         mock_client = MagicMock()
         mock_client.publish = AsyncMock()
+        mock_client.eval = mock_pipe.execute
         mock_client.pipeline.return_value = mock_pipe
 
         with (
@@ -206,6 +205,7 @@ class TestRedisRunBroker:
         mock_pipe.execute = AsyncMock()
         mock_client = MagicMock()
         mock_client.publish = AsyncMock(side_effect=[RedisConnectionError("blip"), None])
+        mock_client.eval = mock_pipe.execute
         mock_client.pipeline.return_value = mock_pipe
 
         with (
@@ -228,6 +228,7 @@ class TestRedisRunBroker:
         mock_pipe.execute = AsyncMock(side_effect=RedisConnectionError("down"))
         mock_client = MagicMock()
         mock_client.publish = AsyncMock(side_effect=RedisConnectionError("down"))
+        mock_client.eval = mock_pipe.execute
         mock_client.pipeline.return_value = mock_pipe
 
         with (
@@ -465,10 +466,10 @@ class TestRedisRunBroker:
         with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
             mock_rm.get_client.return_value = mock_client
 
-            events = await broker.replay("evt-999")
+            with pytest.raises(HTTPException) as exc:
+                await broker.replay("evt-999")
+            assert exc.value.status_code == 409
 
-        assert len(events) == 1
-        assert events[0] == ("evt-1", ("values", {"a": 1}))
 
     @pytest.mark.asyncio
     async def test_replay_returns_empty_when_no_cache(self) -> None:
@@ -550,8 +551,8 @@ class TestRedisRunBroker:
             async for event_id, payload in broker.aiter():
                 events.append((event_id, payload))
 
-        # Should exit with no live events since end was already in buffer
-        assert len(events) == 0
+        # Subscribe first, then replay terminal data to close the subscribe race.
+        assert events == [("evt-end", ("end", {"status": "success"}))]
 
     def test_mark_finished(self) -> None:
         broker = self._make_broker()

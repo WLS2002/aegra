@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -37,8 +37,11 @@ from aegra_api.models import (
     User,
 )
 from aegra_api.models.errors import CONFLICT, NOT_FOUND, AgentProtocolError
+from aegra_api.models.search_limit import effective_search_limit
 from aegra_api.services.streaming_service import streaming_service
+from aegra_api.services.thread_lifecycle import require_writable_thread
 from aegra_api.services.thread_state_service import ThreadStateService
+from aegra_api.utils.jsonb import jsonb_patch, jsonb_shallow_merge
 from aegra_api.utils.run_utils import strip_pinned_config_keys
 
 router = APIRouter(tags=["Threads"], dependencies=auth_dependency)
@@ -184,6 +187,7 @@ async def create_thread(
 
     thread_id = request.thread_id or str(uuid4())
 
+    await require_writable_thread(session, thread_id, user_id=user.identity)
     metadata = request.metadata or {}
     # Always enforce owner from authenticated user
     metadata["owner"] = user.identity
@@ -312,18 +316,24 @@ async def update_thread(
         if isinstance(handler_meta, dict):
             request.metadata = {**(request.metadata or {}), **handler_meta}
 
+    await require_writable_thread(session, thread_id, user_id=user.identity)
     stmt = select(ThreadORM).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
     thread = await session.scalar(stmt)
 
     if not thread:
         raise HTTPException(404, f"Thread '{thread_id}' not found")
 
-    thread.updated_at = datetime.now(UTC)
-
+    values: dict[str, Any] = {"updated_at": datetime.now(UTC)}
     if request.metadata:
-        current_metadata = dict(thread.metadata_json or {})
-        current_metadata.update(request.metadata)
-        thread.metadata_json = current_metadata
+        values["metadata_json"] = jsonb_shallow_merge(
+            ThreadORM.metadata_json, jsonb_patch(request.metadata, "metadata_patch")
+        )
+    await session.execute(
+        update(ThreadORM)
+        .where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
 
     await session.commit()
     await session.refresh(thread)
@@ -464,6 +474,7 @@ async def update_thread_state(
         )
 
     try:
+        await require_writable_thread(session, thread_id, user_id=user.identity)
         stmt = select(ThreadORM).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
         thread = await session.scalar(stmt)
         if not thread:
@@ -517,6 +528,11 @@ async def update_thread_state(
                     else:
                         update_values = update_values[0] if update_values else None
 
+                # Persist protection before the checkpoint write: if the process dies
+                # between the two databases, a sweeper must never delete user state.
+                thread.cleanup_protected = True
+                await session.commit()
+
                 # Update the state using aupdate_state
                 # aupdate_state signature: aupdate_state(config, values, as_node=None)
                 # When as_node is not specified, the graph may try to continue execution,
@@ -561,6 +577,8 @@ async def update_thread_state(
                     checkpoint_info.get("checkpoint_id"),
                 )
 
+                thread.updated_at = datetime.now(UTC)
+                await session.commit()
                 return ThreadStateUpdateResponse(checkpoint=checkpoint_info)
 
         except HTTPException:
@@ -848,6 +866,7 @@ async def delete_thread(
     value = {"thread_id": thread_id}
     filters = await handle_event(ctx, value)
 
+    await require_writable_thread(session, thread_id, user_id=user.identity)
     stmt = select(ThreadORM).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
     # Deleting by id must respect the handler filter too, or a scoped handler
     # blocks listing a thread while still allowing its deletion.
@@ -918,7 +937,7 @@ async def search_threads(
         stmt = stmt.where(ThreadORM.metadata_json.op("@>")(request.metadata))
 
     offset = request.offset or 0
-    limit = request.limit or 20
+    limit = request.limit if request.limit is not None else effective_search_limit()
     column, asc = _resolve_sort(request)
     direction = column.asc() if asc else column.desc()
     # Secondary sort on thread_id keeps offset pagination stable when the

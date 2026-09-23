@@ -1,3 +1,4 @@
+import importlib.util
 import logging
 import logging.config
 import sys
@@ -34,11 +35,16 @@ def get_logging_config() -> dict[str, Any]:
         # on Windows to avoid UnicodeEncodeError through colorama.
         if sys.platform == "win32":
             exception_formatter = structlog.dev.plain_traceback
-        else:
+        elif importlib.util.find_spec("rich") is not None:
             exception_formatter = structlog.dev.RichTracebackFormatter(
                 show_locals=False,
                 max_frames=10,
             )
+        else:
+            # Rich is an optional development dependency.  A missing package
+            # must not replace the original application exception with a
+            # formatter NameError.
+            exception_formatter = structlog.dev.plain_traceback
         final_renderer = structlog.dev.ConsoleRenderer(
             colors=True,
             pad_level=True,

@@ -14,6 +14,7 @@ import contextvars
 import os
 import re
 import socket
+import time
 from datetime import UTC, datetime, timedelta
 
 import structlog
@@ -27,6 +28,7 @@ from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import _get_session_maker
 from aegra_api.core.redis_manager import redis_manager
 from aegra_api.models.run_job import RunJob
+from aegra_api.observability.metrics import POSTGRES_DISCOVERED_RUNS
 from aegra_api.observability.span_enrichment import merge_run_metadata, set_trace_context
 from aegra_api.services.base_executor import BaseExecutor
 from aegra_api.services.run_executor import (
@@ -97,6 +99,7 @@ class WorkerExecutor(BaseExecutor):
         # runs has no active_runs entry, yet its run still needs the drain requeue.
         self._job_tasks: dict[asyncio.Task[None], str] = {}
         self._running = False
+        self._last_postgres_poll = 0.0
         self._instance_id = f"{socket.gethostname()}-{os.getpid()}"
 
     # ------------------------------------------------------------------
@@ -321,17 +324,24 @@ class WorkerExecutor(BaseExecutor):
     # ------------------------------------------------------------------
 
     async def _dequeue(self) -> str | None:
-        """BLPOP with 5s timeout. Falls back to Postgres polling if Redis is down."""
+        """Discover committed jobs even when Redis reads work but enqueue writes fail."""
+        now = time.monotonic()
+        if now - self._last_postgres_poll >= settings.worker.POSTGRES_POLL_INTERVAL_SECONDS:
+            self._last_postgres_poll = now
+            pending = await self._poll_postgres()
+            if pending is not None:
+                POSTGRES_DISCOVERED_RUNS.inc()
+                return pending
         try:
             client = redis_manager.get_client()
             result = await client.blpop(settings.worker.WORKER_QUEUE_KEY, timeout=5)  # type: ignore[arg-type]
             if result is None:
-                return None
+                return await self._poll_postgres()
             return result[1]
         except RedisTimeoutError:
             # Idle expiry: a blocking BLPOP hit the socket timeout with no jobs.
-            # Normal when the queue is empty, not a connectivity failure — re-loop.
-            return None
+            # Redis may accept reads while rejecting writes (maxmemory/noeviction).
+            return await self._poll_postgres()
         except RedisError as exc:
             logger.warning("Redis BLPOP failed, falling back to Postgres poll", error=str(exc))
             await asyncio.sleep(settings.worker.POSTGRES_POLL_INTERVAL_SECONDS)

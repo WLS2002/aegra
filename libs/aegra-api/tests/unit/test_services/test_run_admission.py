@@ -10,7 +10,7 @@ from aegra_api.services.run_preparation import _admit_run
 @pytest.mark.parametrize("active_run", ["pending-run", "running-run"])
 async def test_reject_active_run_without_committing(active_run: str) -> None:
     session = AsyncMock()
-    session.scalar.return_value = active_run
+    session.scalar.side_effect = [None, active_run]
 
     with pytest.raises(HTTPException) as exc:
         await _admit_run(session, "thread-1", user_id="user-1", strategy="reject")
@@ -36,10 +36,11 @@ async def test_reject_allows_thread_without_active_runs() -> None:
 @pytest.mark.parametrize("strategy", [None, "enqueue", "interrupt", "rollback"])
 async def test_other_strategies_serialize_admission_without_changing_behavior(strategy: str | None) -> None:
     session = AsyncMock()
+    session.scalar.return_value = None
 
     await _admit_run(session, "thread-1", user_id="user-1", strategy=strategy)
 
-    session.scalar.assert_not_awaited()
+    session.scalar.assert_awaited_once()
     statement = session.execute.call_args.args[0].compile(dialect=postgresql.dialect())
     assert "pg_advisory_xact_lock" in str(statement)
     assert "thread-1" in statement.params.values()

@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aegra_api.core.orm import Assistant as AssistantORM
 from aegra_api.core.orm import Cron as CronORM
 from aegra_api.core.orm import get_session
+from aegra_api.models import User
 from aegra_api.models.crons import (
     CronCountRequest,
     CronCreate,
@@ -28,6 +29,7 @@ from aegra_api.models.crons import (
     OnRunCompleted,
 )
 from aegra_api.services.langgraph_service import LangGraphService, get_langgraph_service
+from aegra_api.services.scheduled_auth import principal_snapshot
 from aegra_api.settings import settings
 from aegra_api.utils.assistants import resolve_assistant_id
 
@@ -169,6 +171,12 @@ def _cron_to_response(row: CronORM) -> CronResponse:
         next_run_date=row.next_run_date,
         metadata=row.metadata_dict or {},
         enabled=row.enabled,
+        last_run_id=row.last_run_id,
+        last_enqueued_at=row.last_enqueued_at,
+        last_error_code=row.last_error_code,
+        consecutive_failures=row.consecutive_failures or 0,
+        retry_at=row.retry_at,
+        blocked=bool(row.blocked),
     )
 
 
@@ -206,6 +214,7 @@ class CronService:
         user_identity: str,
         *,
         thread_id: str | None = None,
+        principal: User | None = None,
     ) -> CronORM:
         """Create a new cron job record.
 
@@ -280,6 +289,7 @@ class CronService:
             assistant_id=resolved_assistant_id,
             thread_id=thread_id,
             user_id=user_identity,
+            principal=principal_snapshot(principal) if principal is not None else None,
             schedule=request.schedule,
             payload=payload,
             metadata_dict=request.metadata or {},
@@ -302,11 +312,21 @@ class CronService:
         cron_id: str,
         request: CronUpdate,
         user_identity: str,
+        *,
+        principal: User | None = None,
     ) -> CronResponse:
         """Update an existing cron job and return the updated ``CronResponse``."""
         cron = await self._get_cron_or_404(cron_id, user_identity, lock=True)
 
         values: dict[str, Any] = {"updated_at": datetime.now(UTC)}
+        if principal is not None:
+            values.update(
+                principal=principal_snapshot(principal),
+                blocked=False,
+                retry_at=None,
+                consecutive_failures=0,
+                last_error_code=None,
+            )
         existing_payload = dict(cron.payload or {})
 
         if request.timezone is not None:
@@ -461,6 +481,8 @@ class CronService:
             select(CronORM.cron_id)
             .where(
                 CronORM.enabled.is_(True),
+                CronORM.blocked.is_(False),
+                or_(CronORM.retry_at.is_(None), CronORM.retry_at <= now),
                 CronORM.next_run_date <= now,
                 (CronORM.claimed_until.is_(None)) | (CronORM.claimed_until <= now),
             )

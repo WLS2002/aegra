@@ -19,6 +19,7 @@ from aegra_api.core.redis_manager import redis_manager
 from aegra_api.models.run_job import RunJob
 from aegra_api.models.wakeups import TimedWakeup, extract_wakeups
 from aegra_api.services.broker import broker_manager
+from aegra_api.services.error_details import describe_error, error_summary
 from aegra_api.services.event_streaming.native_stream import stream_native_v3_events
 from aegra_api.services.graph_streaming import stream_graph_events
 from aegra_api.services.langgraph_service import create_run_config, get_langgraph_service
@@ -126,7 +127,8 @@ async def _execute_run(job: RunJob) -> None:
                 await _best_effort_signal(streaming_service.signal_run_cancelled, run_id)
         raise
     except Exception as exc:
-        logger.exception("Run failed", run_id=run_id)
+        details = describe_error(exc)
+        logger.error("Run failed", run_id=run_id, thread_id=thread_id, error_details=details)
         safe_message = f"{type(exc).__name__}: execution failed"
         finalized = await finalize_run(
             run_id,
@@ -135,7 +137,8 @@ async def _execute_run(job: RunJob) -> None:
             status="error",
             thread_status="error",
             output={},
-            error=str(exc),
+            error=error_summary(details),
+            error_details=details,
         )
         if finalized:
             await _best_effort_signal(streaming_service.signal_run_error, run_id, safe_message, type(exc).__name__)

@@ -99,6 +99,12 @@ class CronResponse(BaseModel):
     next_run_date: datetime | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = True
+    last_run_id: str | None = None
+    last_enqueued_at: datetime | None = None
+    last_error_code: str | None = None
+    consecutive_failures: int = 0
+    retry_at: datetime | None = None
+    blocked: bool = False
 
 
 class CronUpdate(BaseModel):

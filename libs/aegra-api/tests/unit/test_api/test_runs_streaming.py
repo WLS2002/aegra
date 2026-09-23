@@ -518,3 +518,10 @@ class TestRunsStreamingEndpoints:
             assert error_event[0] == "error"
             assert error_event[1]["error"] == "ValueError"
             assert error_event[1]["message"] == "ValueError: execution failed"
+
+
+@pytest.fixture(autouse=True)
+def prepared_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+    from aegra_api.services.streaming_service import streaming_service
+
+    monkeypatch.setattr(streaming_service, "prepare_replay", AsyncMock(return_value=[]))

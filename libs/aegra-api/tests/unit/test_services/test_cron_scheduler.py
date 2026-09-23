@@ -44,6 +44,13 @@ def _make_cron_orm(
     cron.on_run_completed = on_run_completed
     cron.end_time = end_time
     cron.next_run_date = next_run_date or now
+    cron.last_run_id = None
+    cron.last_enqueued_at = None
+    cron.last_error_code = None
+    cron.consecutive_failures = 0
+    cron.retry_at = None
+    cron.blocked = False
+    cron.principal = {"identity": user_id, "is_authenticated": True, "permissions": []}
     return cron
 
 
@@ -303,7 +310,7 @@ class TestFireCron:
 
             mock_prepare.assert_awaited_once()
             # Should advance next_run_date
-            mock_session.execute.assert_awaited_once()
+            assert mock_session.execute.await_count == 2
             mock_session.commit.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -447,8 +454,8 @@ class TestFireCron:
             mock_prepare.return_value = ("run-1", Mock(), None)
             await scheduler._fire_cron(mock_session, cron)
 
-            # Should set enabled=False via execute
-            mock_session.execute.assert_awaited_once()
+            # Persist dispatch history before disabling the expired schedule.
+            assert mock_session.execute.await_count == 2
             mock_session.commit.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -627,3 +634,10 @@ class TestSchedulerLoop:
             await scheduler._loop()
 
         assert call_count == 2
+
+
+@pytest.fixture(autouse=True)
+def resolve_scheduler_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("aegra_api.services.cron_scheduler.resolve_authorization_target", AsyncMock(return_value=("asst-001", "test-graph")))
+    monkeypatch.setattr("aegra_api.services.cron_scheduler.schedule_background_cleanup", Mock())
+    monkeypatch.setattr("aegra_api.services.run_auth.resolve_authorization_target", AsyncMock(return_value=("asst-001", "test-graph")))

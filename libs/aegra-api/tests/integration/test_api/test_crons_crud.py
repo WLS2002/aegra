@@ -312,6 +312,12 @@ class TestCreateCronExtended:
         cron_orm.next_run_date = _NOW
         cron_orm.created_at = _NOW
         cron_orm.updated_at = _NOW
+        cron_orm.last_run_id = None
+        cron_orm.last_enqueued_at = None
+        cron_orm.last_error_code = None
+        cron_orm.consecutive_failures = 0
+        cron_orm.retry_at = None
+        cron_orm.blocked = False
         mock_cron_service.create_cron.return_value = cron_orm
 
         resp = client.post(

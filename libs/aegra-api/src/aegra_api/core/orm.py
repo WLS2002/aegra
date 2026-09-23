@@ -147,8 +147,14 @@ class Thread(Base):
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
 
+    cleanup_run_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cleanup_protected: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+
     # Indexes for performance
-    __table_args__ = (Index("idx_thread_user", "user_id"),)
+    __table_args__ = (
+        Index("idx_thread_user", "user_id"),
+        Index("ix_thread_cleanup_pending", "cleanup_run_id", postgresql_where=text("cleanup_run_id IS NOT NULL")),
+    )
 
 
 class Run(Base):
@@ -166,6 +172,7 @@ class Run(Base):
     context: Mapped[dict | None] = mapped_column(JsonbSafe, nullable=True)
     output: Mapped[dict | None] = mapped_column(JsonbSafe)
     error_message: Mapped[str | None] = mapped_column(Text)
+    error_details: Mapped[dict | None] = mapped_column(JsonbSafe, nullable=True)
     user_id: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
@@ -238,6 +245,13 @@ class Cron(Base):
     end_time: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     next_run_date: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     claimed_until: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    principal: Mapped[dict | None] = mapped_column(JsonbSafe, nullable=True)
+    last_run_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_enqueued_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    consecutive_failures: Mapped[int] = mapped_column(Integer, server_default=text("0"), nullable=False)
+    retry_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    blocked: Mapped[bool] = mapped_column(Boolean, server_default=text("false"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
 

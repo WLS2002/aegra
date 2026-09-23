@@ -81,10 +81,15 @@ class StreamingService:
         await broker.put(end_event_id, ("end", {"status": "error"}))
         broker_manager.cleanup_broker(run_id)
 
+    async def prepare_replay(self, run_id: str, last_event_id: str) -> list[tuple[str, Any]]:
+        return await broker_manager.get_or_create_broker(run_id).replay(last_event_id)
+
     async def stream_run_execution(
         self,
         run: Run,
         last_event_id: str | None = None,
+        *,
+        replay_events: list[tuple[str, Any]] | None = None,
     ) -> AsyncGenerator[str, None]:
         """Stream run execution with unified producer-consumer pattern.
 
@@ -100,7 +105,7 @@ class StreamingService:
             if last_event_id:
                 last_sent_sequence = extract_event_sequence(last_event_id)
 
-            async for event_id, sse_event in self._replay_stored_events(run_id, last_event_id):
+            async for event_id, sse_event in self._replay_stored_events(run_id, last_event_id, replay_events):
                 # Track the highest replayed sequence for live dedup
                 replayed_seq = extract_event_sequence(event_id)
                 if replayed_seq > last_sent_sequence:
@@ -124,14 +129,17 @@ class StreamingService:
             logger.exception("stream execution failed", run_id=run_id)
             yield create_error_event({"error": type(e).__name__, "message": "execution failed"})
 
-    async def _replay_stored_events(self, run_id: str, last_event_id: str | None) -> AsyncIterator[tuple[str, str]]:
+    async def _replay_stored_events(
+        self, run_id: str, last_event_id: str | None, stored_events: list[tuple[str, Any]] | None = None
+    ) -> AsyncIterator[tuple[str, str]]:
         """Replay stored events from the broker's replay buffer.
 
         Yields (event_id, sse_event) tuples so the caller can track
         the highest replayed sequence for live deduplication.
         """
         broker = broker_manager.get_or_create_broker(run_id)
-        stored_events = await broker.replay(last_event_id)
+        if stored_events is None:
+            stored_events = await broker.replay(last_event_id)
 
         for event_id, raw_event in stored_events:
             sse_event = await self._convert_raw_to_sse(event_id, raw_event)
@@ -146,7 +154,7 @@ class StreamingService:
         # If run is in a terminal state and broker is either missing or finished,
         # there are no live events to stream. Using get_broker (not get_or_create)
         # avoids creating a blank broker that would hang forever in aiter().
-        if run.status in ["success", "error", "interrupted"] and (broker is None or broker.is_finished()):
+        if run.status in ["success", "error", "interrupted"]:
             return
 
         if broker is None:
@@ -194,6 +202,7 @@ class StreamingService:
 
     async def cleanup_run(self, run_id: str) -> None:
         """Clean up streaming resources for a run."""
+        self.event_counters.pop(run_id, None)
         broker_manager.cleanup_broker(run_id)
 
     async def _convert_raw_to_sse(self, event_id: str, raw_event: Any) -> str | None:

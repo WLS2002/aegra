@@ -24,6 +24,13 @@ REAPER_RECOVERED_RUNS = prometheus_client.Counter(
     labelnames=["outcome"],
 )
 
+RUNTIME_BACKLOG = prometheus_client.Gauge(
+    "aegra_runtime_backlog", "Durable runtime backlog, refreshed by health probes", ["kind"]
+)
+POSTGRES_DISCOVERED_RUNS = prometheus_client.Counter(
+    "aegra_postgres_discovered_runs_total", "Committed runs discovered through periodic PostgreSQL polling"
+)
+
 # Pre-create label children so every outcome series renders as 0 on /metrics
 # before the first recovery event (absent series break rate() alerts).
 for _outcome in ("crashed_retried", "crashed_exhausted", "stuck_pending"):

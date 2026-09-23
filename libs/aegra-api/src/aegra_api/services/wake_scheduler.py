@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import cast
 
 import structlog
+from fastapi import HTTPException
 from langchain_core.runnables import RunnableConfig
 from sqlalchemy import select
 
@@ -20,6 +21,7 @@ from aegra_api.services.langgraph_service import create_run_config, get_langgrap
 from aegra_api.services.run_auth import apply_run_authorization
 from aegra_api.services.run_preparation import _admit_run, _prepare_run
 from aegra_api.services.run_requests import find_request, request_digest
+from aegra_api.services.scheduled_auth import principal_snapshot, restore_scheduled_user
 from aegra_api.settings import settings
 
 logger = structlog.getLogger(__name__)
@@ -96,7 +98,24 @@ class WakeScheduler:
                 on_disconnect="continue",
                 multitask_strategy="reject",
             )
-            await apply_run_authorization(job.user, original.thread_id, request)
+            try:
+                scheduled_user = await restore_scheduled_user(
+                    principal_snapshot(job.user),
+                    owner=original.user_id,
+                    graph_id=job.identity.graph_id,
+                    source="wakeup",
+                )
+                await apply_run_authorization(scheduled_user, original.thread_id, request)
+            except HTTPException as exc:
+                if exc.status_code not in {401, 403}:
+                    raise
+                for timer in timers:
+                    timer.status = "blocked"
+                await session.commit()
+                logger.warning(
+                    "Timer authorization blocked", run_id=run_id, error_code="scheduled_authorization_denied"
+                )
+                return
             # Match preparation's lock order: request first, then thread.
             saved = await find_request(
                 session,
@@ -126,14 +145,16 @@ class WakeScheduler:
                     timer.status = "cancelled"
                 await session.commit()
                 return
-            config = create_run_config(run_id, original.thread_id, job.user, additional_config=job.execution.config)
+            config = create_run_config(
+                run_id, original.thread_id, scheduled_user, additional_config=job.execution.config
+            )
             config["configurable"].pop("checkpoint_id", None)
             service = get_langgraph_service()
             async with service.get_graph(
                 job.identity.graph_id,
                 config=config,
                 access_context="threads.create_run",
-                user=job.user,
+                user=scheduled_user,
                 context=job.execution.context,
             ) as graph:
                 snapshot = await graph.aget_state(cast(RunnableConfig, config))
@@ -151,7 +172,7 @@ class WakeScheduler:
                 session,
                 original.thread_id,
                 request,
-                job.user,
+                scheduled_user,
                 initial_status="pending",
                 idempotency_key=key,
             )

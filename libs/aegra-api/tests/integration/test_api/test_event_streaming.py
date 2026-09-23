@@ -8,6 +8,7 @@ import uuid
 from collections.abc import Iterator
 from functools import partial
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import FastAPI
@@ -17,6 +18,7 @@ from aegra_api.api import event_streaming as es_module
 from aegra_api.core.auth_deps import get_current_user, require_auth
 from aegra_api.models.auth import User
 from aegra_api.models.event_streaming import EventStreamRequest
+from aegra_api.models.runs import RunCreate
 from aegra_api.services.broker import broker_manager
 from aegra_api.services.event_streaming import capabilities as caps
 from aegra_api.services.event_streaming import commands as cmd_module
@@ -82,7 +84,10 @@ def _v2_enabled(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 class TestCommandRoute:
     def test_run_start_returns_success_envelope(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured_requests: list[RunCreate] = []
+
         async def fake_prepare(*_args: Any, **_kwargs: Any) -> tuple[str, object, object]:
+            captured_requests.append(_args[2])
             return "run-1", object(), object()
 
         monkeypatch.setattr(cmd_module, "_prepare_run", fake_prepare)
@@ -90,7 +95,15 @@ class TestCommandRoute:
 
         resp = client.post(
             "/threads/t1/commands",
-            json={"id": 1, "method": "run.start", "params": {"assistant_id": "agent", "input": {"messages": []}}},
+            json={
+                "id": 1,
+                "method": "run.start",
+                "params": {
+                    "assistant_id": "agent",
+                    "input": {"messages": []},
+                    "context": {"tenant_id": "acme"},
+                },
+            },
         )
         assert resp.status_code == 200
         assert resp.json() == {
@@ -99,6 +112,102 @@ class TestCommandRoute:
             "result": {"run_id": "run-1"},
             "meta": {"applied_through_seq": 0},
         }
+        assert captured_requests[0].context == {"tenant_id": "acme"}
+
+    def test_run_start_forks_from_configurable_checkpoint_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured_requests: list[RunCreate] = []
+
+        async def fake_prepare(*_args: Any, **_kwargs: Any) -> tuple[str, object, object]:
+            captured_requests.append(_args[2])
+            return "run-1", object(), object()
+
+        monkeypatch.setattr(cmd_module, "_prepare_run", fake_prepare)
+        client = TestClient(_make_app(monkeypatch))
+        checkpoint_id = "1ef4f797-8335-6428-8001-8a1503f9b875"
+
+        resp = client.post(
+            "/threads/t1/commands",
+            json={
+                "id": 1,
+                "method": "run.start",
+                "params": {"assistant_id": "agent", "config": {"configurable": {"checkpoint_id": checkpoint_id}}},
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["type"] == "success"
+        assert captured_requests[0].checkpoint == {"checkpoint_id": checkpoint_id}
+        assert captured_requests[0].input is None
+
+    def test_run_start_rejects_malformed_checkpoint_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        prepare = AsyncMock()
+        monkeypatch.setattr(cmd_module, "_prepare_run", prepare)
+        client = TestClient(_make_app(monkeypatch))
+
+        resp = client.post(
+            "/threads/t1/commands",
+            json={
+                "id": 1,
+                "method": "run.start",
+                "params": {"assistant_id": "agent", "config": {"configurable": {"checkpoint_id": "not-a-uuid"}}},
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["error"] == "invalid_argument"
+        prepare.assert_not_called()
+
+    def test_input_respond_forwards_update_goto_and_context(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured_requests: list[RunCreate] = []
+
+        async def fake_prepare(*_args: Any, **_kwargs: Any) -> tuple[str, object, object]:
+            captured_requests.append(_args[2])
+            return "run-2", object(), object()
+
+        monkeypatch.setattr(cmd_module, "_prepare_run", fake_prepare)
+        client = TestClient(_make_app(monkeypatch))
+
+        resp = client.post(
+            "/threads/t1/commands",
+            json={
+                "id": 2,
+                "method": "input.respond",
+                "params": {
+                    "assistant_id": "agent",
+                    "interrupt_id": "a" * 32,
+                    "namespace": [],
+                    "response": {"approved": True},
+                    "update": {"reviewed_by": "alice"},
+                    "goto": "finalize",
+                    "context": {"reasoning_effort": "high"},
+                },
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["type"] == "success"
+        request = captured_requests[0]
+        assert request.command == {
+            "resume": {"a" * 32: {"approved": True}},
+            "update": {"reviewed_by": "alice"},
+            "goto": "finalize",
+        }
+        assert request.context == {"reasoning_effort": "high"}
+
+    def test_input_respond_rejects_non_object_update(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        prepare = AsyncMock()
+        monkeypatch.setattr(cmd_module, "_prepare_run", prepare)
+        client = TestClient(_make_app(monkeypatch))
+
+        resp = client.post(
+            "/threads/t1/commands",
+            json={
+                "id": 3,
+                "method": "input.respond",
+                "params": {"assistant_id": "agent", "response": 1, "update": ["not", "an", "object"]},
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["type"] == "error"
+        assert resp.json()["error"] == "invalid_argument"
+        prepare.assert_not_called()
 
     def test_unknown_command_returns_error_envelope_on_200(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Protocol errors ride HTTP 200 so envelope-parsing clients see the code."""

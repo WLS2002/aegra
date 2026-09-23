@@ -3,6 +3,7 @@
 import re
 from datetime import datetime
 from typing import Any, Literal, Self
+from uuid import UUID
 
 from pydantic import (
     BaseModel,
@@ -41,6 +42,10 @@ class RunCreate(BaseModel):
     checkpoint: dict[str, Any] | None = Field(
         None,
         description="Checkpoint configuration (e.g., {'checkpoint_id': '...', 'checkpoint_ns': ''})",
+    )
+    checkpoint_id: UUID | None = Field(
+        None,
+        description="Checkpoint to run from. Short form of checkpoint={'checkpoint_id': ...}; 'checkpoint' wins if both set.",
     )
     stream: bool = Field(False, description="Enable streaming response")
     stream_mode: str | list[str] | None = Field(None, description="Requested stream mode(s)")
@@ -137,7 +142,8 @@ class RunCreate(BaseModel):
                 raise ValueError("Cannot specify both 'input' and 'command' - they are mutually exclusive")
         # Checkpoint-only resume keeps input=None so Pregel resumes from next=[...]
         # instead of restarting from __start__ with an empty input.
-        if self.input is None and self.command is None and self.checkpoint is None:
+        has_checkpoint = self.checkpoint is not None or self.checkpoint_id is not None
+        if self.input is None and self.command is None and not has_checkpoint:
             raise ValueError("Must specify at least one of 'input', 'command', or 'checkpoint'")
         return self
 
@@ -164,6 +170,9 @@ class Run(BaseModel):
     )
     parent: RunIdentity | None = Field(None, description="Trusted parent execution that created this run.")
     error_message: str | None = Field(None, description="Error message if the run failed.")
+    error_details: dict[str, Any] | None = Field(
+        None, description="Bounded safe error classifications and fingerprints."
+    )
     config: dict[str, Any] | None = Field(
         default_factory=dict, description="Configuration passed to the graph at runtime."
     )
